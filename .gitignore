@@ -1,0 +1,48 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Private development data
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+*.dmp
+*.pcap
+*.pcapng
+*.etl
+*.pdb
+work/
+outputs/
+
+# Generated Python verification artifacts
+__pycache__/
+*.py[cod]
+
+# Downloaded capture runtime (reproducible setup script)
+src-tauri/vendor/windivert/*.dll
+src-tauri/vendor/windivert/*.sys

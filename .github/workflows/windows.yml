@@ -1,0 +1,36 @@
+name: Windows checks
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.1'
+      - name: Install pnpm
+        run: npm install --global pnpm@11.1.0
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Stage verified capture dependency
+        run: ./scripts/setup-windivert.ps1
+      - name: Frontend checks
+        run: |
+          pnpm lint
+          pnpm build
+          node --experimental-strip-types --test src/utils/sessionHistory.test.ts src/utils/speedtest.test.ts
+      - name: Rust checks
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked --lib
+      - name: Speedtest engine checks
+        working-directory: sidecar/librespeed
+        run: go test ./...
+      - name: Standalone build
+        run: pnpm build:native

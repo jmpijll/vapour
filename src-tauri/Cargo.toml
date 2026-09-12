@@ -1,0 +1,54 @@
+[package]
+name = "vapour"
+version = "0.1.0"
+description = "Vapour - A quiet network monitor"
+edition = "2021"
+rust-version = "1.88"
+license = "GPL-3.0-only"
+
+[lib]
+name = "app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.6", features = [] }
+
+[dependencies]
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+log = "0.4"
+tauri = { version = "2.11", features = ["tray-icon", "devtools"] }
+tauri-plugin-log = "2"
+window-vibrancy = "0.6"
+tokio = { version = "1", features = ["full"] }
+parking_lot = "0.12"
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png"] }
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_WindowsFirewall",
+    "Win32_System_Com",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Threading",
+    "Win32_System_JobObjects",
+    "Win32_System_ProcessStatus",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dwm",
+    "Win32_Security",
+    "Win32_System_Diagnostics_Etw",
+    "Win32_System_Diagnostics_ToolHelp"
+] }
+ferrisetw = "1.2.0"
+sha2 = "0.10"
+
+socket2 = "0.6"
+
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]
