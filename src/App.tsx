@@ -130,7 +130,7 @@ export function App() {
     [systemDark, setSystemDark] = useState(
       () => matchMedia("(prefers-color-scheme: dark)").matches,
     );
-  const [view, setView] = useState<"list" | "detail" | "settings" | "speedtest" | "capture">("list");
+  const [view, setView] = useState<"list" | "detail" | "settings" | "speedtest" | "capture" | "firewall">("list");
   const [selected, setSelected] = useState<string | null>(null),
     [selectedApp, setSelectedApp] = useState<GroupedProcess | null>(null);
   const [query, setQuery] = useState(""),
@@ -301,6 +301,7 @@ export function App() {
           </button>
           <button className={"icon-button " + (capture.status.active ? "capture-recording" : "")} aria-label={capture.status.active ? "Capture recording" : "Capture"} title={capture.status.active ? "Capture recording" : "Capture"} onClick={()=>setView("capture")}><Circle size={16}/></button>
           <button className="icon-button" aria-label="Speedtest" title="Speedtest" onClick={()=>setView("speedtest")}><Gauge size={17}/></button>
+          <button className={"icon-button " + (view === "firewall" ? "selected" : "")} aria-label="Firewall" title="Firewall" aria-pressed={view === "firewall"} onClick={() => setView(view === "firewall" ? "list" : "firewall")}><ShieldCheck size={17}/></button>
           <button
             className={"icon-button " + (view === "settings" ? "selected" : "")}
             aria-label="Settings"
@@ -674,6 +675,64 @@ export function App() {
         )}
         {view === "capture" && <Capture sessionAvailable={!capture.session||!!snapshot?.processes.some(p=>p.sockets.some(s=>s.id===capture.session?.socketId&&!s.closed_at&&s.state==="ESTABLISHED"))} appAvailable={captureAppAvailable} showUnavailable={prefs.showUnavailableInterfaces} capture={capture} networkInterfaces={snapshot?.interfaces||[]} back={()=>((capture.session||capture.appTarget)&&selected?setView("detail"):back())} elevated={firewall.elevated} elevate={()=>void firewall.elevate()}/> }
         {view === "speedtest" && <Speedtest back={back} />}
+        {view === "firewall" && (
+          <section className="settings-view view-enter">
+            <div className="page-heading">
+              <button className="back-button" onClick={back} aria-label="Back" title="Back"><ArrowLeft size={15}/></button>
+              <h1>Firewall</h1>
+            </div>
+            <div className="blocks-heading">
+              <h2>Blocks</h2>
+              <button
+                className="icon-button"
+                aria-label="Refresh firewall rules"
+                title="Refresh"
+                disabled={firewall.busy}
+                onClick={() => void firewall.refresh()}
+              >
+                <RefreshCw size={14} />
+              </button>
+            </div>
+            {firewall.enforcementReason && <p role="status" className="error-banner">{firewall.enforcementReason}</p>}
+            {firewall.rules.length ? (
+              <div className="block-list">
+                {firewall.rules.map((rule) => (
+                  <div key={rule.id} className="block-row">
+                    <div>
+                      <span>{rule.target.path.split(/[\\/]/).pop()}</span>
+                      <small>
+                        {rule.target.remote_ip
+                          ? `${rule.target.protocol} · ${rule.target.remote_ip}:${rule.target.remote_port}`
+                          : "All outgoing traffic"}
+                      </small>
+                    </div>
+                    <button
+                      className="icon-button"
+                      aria-label={
+                        "Unblock " +
+                        rule.target.path +
+                        (rule.target.remote_ip
+                          ? " " + rule.target.remote_ip
+                          : "")
+                      }
+                      disabled={firewall.busy}
+                      title="Remove block"
+                      onClick={() =>
+                        firewall.elevated
+                          ? void firewall.change(rule.target, false)
+                          : void firewall.elevate()
+                      }
+                    >
+                      <X size={15} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="detail-note">No Vapour blocks</p>
+            )}
+          </section>
+        )}
         {view === "settings" && (
           <section className="settings-view view-enter">
             <div className="page-heading">
@@ -745,54 +804,6 @@ export function App() {
                 The network event collector could not start. App rates are
                 unavailable.
               </p>
-            )}
-            <div className="blocks-heading">
-              <h2>Firewall rules</h2>
-              <button
-                className="icon-button"
-                aria-label="Refresh firewall rules"
-                onClick={() => void firewall.refresh()}
-              >
-                <RefreshCw size={14} />
-              </button>
-            </div>
-            {firewall.enforcementReason && <p role="status" className="error-banner">{firewall.enforcementReason}</p>}
-            {firewall.rules.length ? (
-              <div className="block-list">
-                {firewall.rules.map((rule) => (
-                  <div key={rule.id} className="block-row">
-                    <div>
-                      <span>{rule.target.path.split(/[\\/]/).pop()}</span>
-                      <small>
-                        {rule.target.remote_ip
-                          ? `${rule.target.protocol} · ${rule.target.remote_ip}:${rule.target.remote_port}`
-                          : "All outgoing traffic"}
-                      </small>
-                    </div>
-                    <button
-                      className="icon-button"
-                      aria-label={
-                        "Unblock " +
-                        rule.target.path +
-                        (rule.target.remote_ip
-                          ? " " + rule.target.remote_ip
-                          : "")
-                      }
-                      disabled={firewall.busy}
-                      title="Remove block"
-                      onClick={() =>
-                        firewall.elevated
-                          ? void firewall.change(rule.target, false)
-                          : void firewall.elevate()
-                      }
-                    >
-                      <X size={15} />
-                    </button>
-                  </div>
-                ))}
-              </div>
-            ) : (
-              <p className="detail-note">No Vapour blocks</p>
             )}
             <div className="about">
               <Mark />
