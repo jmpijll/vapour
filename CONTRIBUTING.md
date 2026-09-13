@@ -32,3 +32,5 @@ Explain the user-visible change and relevant verification. Include sample-data s
 Include Windows version, build steps, expected behaviour and concise reproduction steps. Redact private data. Report security-sensitive details privately to the maintainer through a suitable private channel; do not post secrets or exploit-bearing private captures in a public issue.
 
 `pnpm exec playwright test` starts an isolated browser preview and checks Basic/Advanced behavior in installed Microsoft Edge.
+
+Dependency updates and outstanding upstream warnings are documented in [docs/DEPENDENCIES.md](docs/DEPENDENCIES.md). Use Node 24 LTS and the pinned Rust toolchain when reproducing CI.
