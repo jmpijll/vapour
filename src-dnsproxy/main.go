@@ -150,6 +150,31 @@ func runProtocol(input io.Reader, output io.Writer) error {
 				_ = runtime.stop()
 				return err
 			}
+		case "reload":
+			var reloadErr error
+			var engine *domainEngine
+			if runtime.service == nil {
+				reloadErr = errors.New("DNS service is not running")
+			} else if request.Rules == nil {
+				reloadErr = errors.New("reload requires rules")
+			} else {
+				engine, reloadErr = newDomainEngine(*request.Rules)
+			}
+			if reloadErr != nil {
+				if err := writeError(sink, reloadErr); err != nil {
+					_ = runtime.stop()
+					return err
+				}
+				continue
+			}
+			// Publish only a completely parsed engine. Each request retains its
+			// snapshot while the old engine is reclaimed by Go's garbage collector.
+			runtime.service.engine.Store(engine)
+			runtime.engine = engine
+			if err := sink.write(statusMessage{Status: "updated", RulesCount: engine.rulesCount()}); err != nil {
+				_ = runtime.stop()
+				return err
+			}
 		case "stop":
 			stopErr := runtime.stop()
 			if stopErr != nil {

@@ -12,6 +12,7 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	dnsproxy "github.com/AdguardTeam/dnsproxy/proxy"
@@ -48,6 +49,7 @@ type config struct {
 type command struct {
 	Op     string  `json:"op"`
 	Config *config `json:"config,omitempty"`
+	Rules  *string `json:"rules,omitempty"`
 }
 
 type statusMessage struct {
@@ -235,7 +237,8 @@ func validateConfig(input config) (config, error) {
 }
 
 type dnsService struct {
-	proxy *dnsproxy.Proxy
+	proxy  *dnsproxy.Proxy
+	engine atomic.Pointer[domainEngine]
 }
 
 func newDNSService(cfg config, engine *domainEngine) (*dnsService, error) {
@@ -255,6 +258,8 @@ func newDNSService(cfg config, engine *domainEngine) (*dnsService, error) {
 	}
 	listenIP := net.ParseIP(cfg.ListenAddress)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	service := &dnsService{}
+	service.engine.Store(engine)
 	server, err := dnsproxy.New(&dnsproxy.Config{
 		Logger: logger,
 		UDPListenAddr: []*net.UDPAddr{{
@@ -266,7 +271,7 @@ func newDNSService(cfg config, engine *domainEngine) (*dnsService, error) {
 			Port: cfg.ListenPort,
 		}},
 		UpstreamConfig: upstreams,
-		RequestHandler: filteringHandler{engine: engine},
+		RequestHandler: filteringHandler{engine: &service.engine},
 		CacheEnabled:   false,
 		DNSSECEnabled:  false,
 		RefuseAny:      true,
@@ -277,7 +282,8 @@ func newDNSService(cfg config, engine *domainEngine) (*dnsService, error) {
 		return nil, fmt.Errorf("create DNS proxy: %w", err)
 	}
 
-	return &dnsService{proxy: server}, nil
+	service.proxy = server
+	return service, nil
 }
 
 func (s *dnsService) start() error {
@@ -320,7 +326,7 @@ func (s *dnsService) tcpAddr() string {
 }
 
 type filteringHandler struct {
-	engine *domainEngine
+	engine *atomic.Pointer[domainEngine]
 }
 
 func (h filteringHandler) ServeDNS(
@@ -328,8 +334,9 @@ func (h filteringHandler) ServeDNS(
 	server *dnsproxy.Proxy,
 	dctx *dnsproxy.DNSContext,
 ) error {
+	engine := h.engine.Load()
 	for _, question := range dctx.Req.Question {
-		if h.engine.decideQuestion(question.Name, question.Qtype).Blocked {
+		if engine.decideQuestion(question.Name, question.Qtype).Blocked {
 			response := (&dns.Msg{}).SetReply(dctx.Req)
 			response.Authoritative = true
 			response.Rcode = dns.RcodeNameError

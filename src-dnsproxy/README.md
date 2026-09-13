@@ -23,9 +23,9 @@ any later Windows resolver routing and rollback policy.
 From this directory in PowerShell:
 
 ```powershell
-& 'C:\Users\jamie\netstat\work\go-runtime\go\bin\go.exe' test ./...
-& 'C:\Users\jamie\netstat\work\go-runtime\go\bin\go.exe' vet ./...
-& 'C:\Users\jamie\netstat\work\go-runtime\go\bin\go.exe' build -o src-dnsproxy.exe .
+go test ./...
+go vet ./...
+go build -o src-dnsproxy.exe .
 ```
 
 The tested runtime is Go 1.27.1.  The upstream dnsproxy README requires Go
@@ -50,6 +50,13 @@ effect after a successful start, which lets a parent process use pipe closure
 as the crash-safe shutdown signal.  Blank lines are ignored.  Unknown JSON
 fields, malformed commands, non-loopback listeners, non-IP upstreams, invalid
 ports, and oversized or unsupported rules produce an `error` status.
+
+Send `{"op":"reload","rules":"||ads.example^"}` to replace the active
+filter without restarting either listener. The replacement is fully parsed
+before an atomic swap; invalid updates leave the previous filter active.
+Each in-flight DNS request retains one consistent filter snapshot. Success
+returns `{"status":"updated","rules_count":1}`. Reload changes only rules,
+not the upstream or listening addresses, and requires a running service.
 
 The alternate mode validates one JSON config file before binding listeners:
 
