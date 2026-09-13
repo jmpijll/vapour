@@ -79,7 +79,7 @@ export function Endpoint({
         <span>{socket.protocol}</span>
         {socket.remote_host && socket.remote_host !== socket.remote_ip && <span className="endpoint-ip">{address}</span>}
         <span>{socket.state.toLowerCase().replaceAll("_", " ")}</span>
-        <span>:{socket.local_port}</span>
+        <span className="advanced-only">{socket.local_ip}:{socket.local_port}</span>
         {error && <span role="status">Select address to copy</span>}
       </div>
     </div>

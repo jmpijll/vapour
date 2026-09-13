@@ -27,6 +27,8 @@ jobs:
           pnpm lint
           pnpm build
           node --experimental-strip-types --test src/utils/sessionHistory.test.ts src/utils/speedtest.test.ts
+      - name: UI mode checks
+        run: pnpm exec playwright test
       - name: Rust checks
         run: cargo test --manifest-path src-tauri/Cargo.toml --locked --lib
       - name: Speedtest engine checks

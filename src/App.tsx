@@ -18,6 +18,7 @@ import {
   Gauge,
   Circle,
   ChartNoAxesCombined,
+  Layers,
 } from "lucide-react";
 import { useNetworkTelemetry } from "./hooks/useNetworkTelemetry";
 import { Capture } from "./components/Capture";
@@ -39,6 +40,7 @@ type Preferences = {
   appsOnly: boolean;
   colorIcons: boolean;
   showUnavailableInterfaces: boolean;
+  advanced: boolean;
 };
 const native = "__TAURI_INTERNALS__" in window;
 function loadPreferences(): Preferences {
@@ -50,6 +52,7 @@ function loadPreferences(): Preferences {
       appsOnly: p.appsOnly !== false,
       colorIcons: p.colorIcons === true,
       showUnavailableInterfaces: p.showUnavailableInterfaces === true,
+      advanced: p.advanced === true,
     };
   } catch {
     return {
@@ -58,6 +61,7 @@ function loadPreferences(): Preferences {
       appsOnly: true,
       colorIcons: false,
       showUnavailableInterfaces: false,
+      advanced: false,
     };
   }
 }
@@ -285,13 +289,14 @@ export function App() {
     </main>;
   }
   return (
-    <main className={"vapour-shell " + (native ? "native" : "preview")}>
+    <main data-mode={prefs.advanced ? "advanced" : "basic"} className={"vapour-shell " + (native ? "native" : "preview")}>
       <header className="titlebar">
         <div className="wordmark" data-tauri-drag-region>
           <Mark />
           <span data-tauri-drag-region>Vapour</span>
         </div>
         <div className="toolbar">
+          <button className={"icon-button " + (prefs.advanced ? "selected" : "")} aria-label="Advanced mode" aria-pressed={prefs.advanced} title={prefs.advanced ? "Advanced" : "Basic"} onClick={() => update({advanced: !prefs.advanced})}><Layers size={16}/></button>
           <button
             className={"icon-button " + (isPinned ? "selected" : "")}
             aria-label={isPinned ? "Unpin window" : "Pin window"}
@@ -459,6 +464,7 @@ export function App() {
                   <ProcessIcon app={app} />
                   <span className="process-info">
                     <span className="process-name">{app.displayName}</span>
+                    <small className="advanced-only muted">{app.pids.length} processes · {app.active_sockets_count} connections</small>
                     {measured && (
                       <span className="usage-track">
                         <span
@@ -611,7 +617,7 @@ export function App() {
                 </button> : <span className="detail-note" role="status">App measurements unavailable</span>
               )}
             </div>
-            <div className="path">{activeApp.path || activeApp.name}</div>
+            <div className="path advanced-only">{activeApp.path || activeApp.name}</div>
             <div className="detail-tabs" aria-label="Filter connections">
               {(["all", "external", "local"] as const).map((value) => (
                 <button
@@ -678,7 +684,7 @@ export function App() {
         )}
         {view === "capture" && <Capture sessionAvailable={!capture.session||!!snapshot?.processes.some(p=>p.sockets.some(s=>s.id===capture.session?.socketId&&!s.closed_at&&s.state==="ESTABLISHED"))} appAvailable={captureAppAvailable} showUnavailable={prefs.showUnavailableInterfaces} capture={capture} networkInterfaces={snapshot?.interfaces||[]} back={()=>((capture.session||capture.appTarget)&&selected?setView("detail"):back())} elevated={firewall.elevated} elevate={()=>void firewall.elevate()}/> }
         {view === "speedtest" && <Speedtest back={back} />}
-        {view === "interfaces" && <InterfaceStatistics interfaces={snapshot?.interfaces || []} back={back}/>}
+        {view === "interfaces" && <InterfaceStatistics interfaces={snapshot?.interfaces || []} advanced={prefs.advanced} back={back}/>}
         {view === "firewall" && (
           <section className="settings-view view-enter">
             <div className="page-heading">
@@ -703,7 +709,8 @@ export function App() {
                 {firewall.rules.map((rule) => (
                   <div key={rule.id} className="block-row">
                     <div>
-                      <span>{rule.target.path.split(/[\\/]/).pop()}</span>
+                      <span title={rule.target.path}>{rule.target.path.split(/[\\/]/).pop()}</span>
+                      <small className="advanced-only">{rule.target.path}</small>
                       <small>
                         {rule.target.remote_ip
                           ? `${rule.target.protocol} · ${rule.target.remote_ip}:${rule.target.remote_port}`
@@ -809,6 +816,7 @@ export function App() {
                 unavailable.
               </p>
             )}
+            <div className="advanced-only"><p className="detail-note">Native telemetry · Windows x64</p></div>
             <div className="about">
               <Mark />
               <span>
