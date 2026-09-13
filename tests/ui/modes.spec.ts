@@ -10,6 +10,9 @@ for (const theme of ["light", "dark"]) {
     await page.getByRole("button", {name: "Interface statistics", exact: true}).click();
     await expect(page.locator(".adapter-details")).toHaveCount(0);
     await mode.click();
+    await page.getByText("Driver", {exact:true}).click();
+    await expect(page.getByText("Example adapter vendor", {exact:true})).toBeVisible();
+    await expect(page.getByText("1.2.3.4", {exact:true})).toBeVisible();
     await page.getByText("IP configuration", {exact:true}).click();
     await expect(page.getByText("192.0.2.10/24", {exact:true})).toBeVisible();
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);

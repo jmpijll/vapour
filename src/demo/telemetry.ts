@@ -20,6 +20,7 @@ export function generateMockSnapshot(): NetworkSnapshot {
         ipv6: null,
         download_speed_bps: Math.round(downBase),
         upload_speed_bps: Math.round(upBase),
+        driver: {status: "available", sampled_at: Date.now(), value: {source: "windows_cim_win32_pnpsigneddriver", provider: "Example adapter vendor", version: "1.2.3.4", date: "2026-01-01"}},
         details: {
           source: "windows_mib_if_row2", interface_guid: "00000000-0000-0000-0000-000000000001", interface_index: 1,
           mtu_bytes: 1500, operational_status: "up", administrative_status: "up", media_state: "connected",
