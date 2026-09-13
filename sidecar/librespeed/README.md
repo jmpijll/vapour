@@ -8,7 +8,7 @@ JSONL entry point, and its tests. This is a duration-controlled adapter/fork,
 not an unmodified official LibreSpeed release. Retained upstream methods are
 not used for Vapour's timed phases.
 
-Build using Go 1.25+ (the module's dependency constraints may require a newer
+Build using Go 1.26+ (the module's dependency constraints may require a newer
 toolchain): `go build -trimpath -o vapour-librespeed.exe .`. Run `go test ./...`.
 The full integration fixture takes at least 44 seconds and only uses localhost.
 
