@@ -155,4 +155,45 @@ mod tests {
         assert_eq!(state.feed, Some(feed));
         assert_eq!(state.error.as_deref(), Some("offline"));
     }
+    #[test]
+    #[ignore = "Downloads official Feodo feed into an isolated temporary cache; no enforcement"]
+    fn live_updater_persists_validated_snapshot() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("vapour-feed-test-{}-{unique}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(self.0.join("feed.json"));
+                let _ = std::fs::remove_dir(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(directory.clone());
+        let path = directory.join("feed.json");
+        let updater = FeedUpdater::new(path.clone());
+        assert!(updater.request(true));
+        assert!(!updater.request(true));
+        let deadline = Instant::now() + Duration::from_secs(40);
+        while updater.status().refreshing && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let status = updater.status();
+        assert!(!status.refreshing, "updater exceeded deadline");
+        assert!(status.available, "update failed: {:?}", status.last_error);
+        assert!(!status.stale);
+        assert!(
+            !updater.request(false),
+            "periodic refresh must respect interval"
+        );
+        let disk = cache::load_feodo_cache(&path).unwrap().unwrap();
+        assert_eq!(updater.snapshot(), Some(disk));
+        println!(
+            "Validated updater cache: {} endpoints",
+            status.endpoint_count
+        );
+    }
 }
