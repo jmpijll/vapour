@@ -4400,6 +4400,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "ferrisetw",
+ "flate2",
  "image",
  "log",
  "parking_lot",
