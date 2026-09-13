@@ -50,3 +50,9 @@ Route reference: https://learn.microsoft.com/en-us/windows/win32/api/netioapi/ns
 The realtime collector is wired to a separate worker, refreshing at most every five seconds. Samples become stale after 15 seconds; a disconnected adapter exposes no cached sample. It reads no SSID/BSSID and performs no scan or location-sensitive fallback. Link quality is a percentage; per-link center frequency is kHz and RSSI is dBm. Undocumented rate and bandwidth units remain raw and are not presented as throughput.
 
 The Windows live check found one disconnected WLAN interface, so no quality query was attempted. This verifies disconnected handling only; connected-driver support and live measurements remain unverified. The ignored live test logs aggregate counts, state and error codes without adapter identifiers.
+
+## Driver metadata
+
+Advanced interface details include optional driver provider, version and date. A fixed, read-only CIM query joins network adapter GUIDs to signed-driver records through the PnP device identifier. The query runs in its own worker at most every five minutes; the throughput sampler never waits for it. Failed queries clear metadata, and samples older than ten minutes are marked stale. Missing fields remain unavailable rather than being inferred from adapter names or link speed.
+
+The PowerShell executable is resolved from the Windows system directory. The process is hidden and contained in a private kill-on-close job, with an eight-second deadline, bounded output and bounded cleanup. No adapter value is interpolated into shell code. The integrated ignored live test returned five adapter records in approximately three seconds on the Windows test host. Browser tests check the Advanced driver fields in both themes using synthetic sample data.
