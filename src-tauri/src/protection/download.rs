@@ -9,7 +9,15 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+pub const ADGUARD_DNS_URL: &str =
+    "https://adguardteam.github.io/AdGuardSDNSFilter/Filters/filter.txt";
 pub fn fetch_feodo() -> Result<Vec<u8>, String> {
+    fetch_source(FEODO_RECOMMENDED_JSON_URL)
+}
+pub fn fetch_adguard_dns() -> Result<String, String> {
+    String::from_utf8(fetch_source(ADGUARD_DNS_URL)?).map_err(|_| "DNS filter is not UTF-8".into())
+}
+fn fetch_source(url: &'static str) -> Result<Vec<u8>, String> {
     let client = reqwest::blocking::Client::builder()
         .https_only(true)
         .redirect(reqwest::redirect::Policy::none())
@@ -19,7 +27,7 @@ pub fn fetch_feodo() -> Result<Vec<u8>, String> {
         .build()
         .map_err(|_| "HTTPS client unavailable".to_string())?;
     let response = client
-        .get(FEODO_RECOMMENDED_JSON_URL)
+        .get(url)
         .send()
         .map_err(|_| "Threat feed download failed".to_string())?;
     if response.status() != reqwest::StatusCode::OK {
@@ -76,5 +84,14 @@ mod tests {
             bytes.len(),
             parsed.endpoints.len()
         );
+    }
+    #[test]
+    #[ignore = "Downloads official AdGuard list to explicit VAPOUR_ADGUARD_FILTER for parser verification"]
+    fn live_adguard_download() {
+        let path = std::env::var_os("VAPOUR_ADGUARD_FILTER").expect("explicit output required");
+        let rules = fetch_adguard_dns().expect("official list download");
+        assert!(!rules.is_empty());
+        std::fs::write(path, &rules).expect("write parser fixture");
+        println!("Official DNS list downloaded: {} bytes", rules.len());
     }
 }
