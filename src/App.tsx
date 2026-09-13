@@ -819,6 +819,7 @@ export function App() {
               </p>
             )}
             <div className="advanced-only"><p className="detail-note">Native telemetry · Windows x64</p></div>
+            <p className="detail-note">IP Geolocation by <a href="https://db-ip.com" target="_blank" rel="noreferrer">DB-IP</a></p>
             <div className="about">
               <Mark />
               <span>

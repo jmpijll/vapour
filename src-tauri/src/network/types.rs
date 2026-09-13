@@ -62,6 +62,7 @@ pub struct SocketStream {
     pub remote_ip: String,
     pub remote_port: u16,
     pub remote_host: Option<String>,
+    pub destination_tags: Option<super::destination_tags::DestinationTagLookup>,
     pub country_code: Option<String>,
     pub country_name: Option<String>,
     pub cloud_provider: Option<String>,

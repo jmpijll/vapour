@@ -23,3 +23,5 @@ pub mod wifi_cache;
 pub mod driver_details;
 pub mod driver_cache;
 pub mod destination_tags;
+pub mod tag_database;
+pub mod tag_worker;

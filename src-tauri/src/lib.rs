@@ -180,6 +180,7 @@ pub fn run() {
             app.manage(protection::controller::ProtectionController::new(feed_updater.clone(), app.path().app_data_dir()?.join("protection").join("threat-protection-intent.json")));
             app.manage(feed_updater);
             app.state::<protection::controller::ProtectionController>().start_updates()?;
+            network::tag_worker::start(&monitor, app.path().app_data_dir()?.join("destination-database"))?;
             let handle = app.handle();
 
             // Load embedded icon

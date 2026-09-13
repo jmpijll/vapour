@@ -37,6 +37,7 @@ pub struct NetworkMonitor {
     ip_configuration: Arc<Mutex<super::ip_config::ConfigCache>>,
     driver_cache: Arc<Mutex<super::driver_cache::DriverCache>>,
     wifi_cache: Arc<Mutex<super::wifi_cache::WifiCache>>,
+    destination_tags: Mutex<Option<Arc<super::destination_tags::DestinationTagCache>>>,
     muted_streams: Mutex<HashSet<String>>,
     process_names_cache: Mutex<HashMap<u32, (String, String)>>,
     usage: super::usage::UsageCollector,
@@ -52,11 +53,16 @@ impl NetworkMonitor {
             ip_configuration: Arc::new(Mutex::new(Default::default())),
             driver_cache: Arc::new(Mutex::new(Default::default())),
             wifi_cache: Arc::new(Mutex::new(Default::default())),
+            destination_tags: Mutex::new(None),
             muted_streams: Mutex::new(HashSet::new()),
             process_names_cache: Mutex::new(HashMap::new()),
             usage: super::usage::UsageCollector::new(),
             firewall_cache: Mutex::new(None),
         }
+    }
+
+    pub fn set_destination_tags(&self, cache: super::destination_tags::DestinationTagCache) {
+        *self.destination_tags.lock()=Some(Arc::new(cache));
     }
 
     pub fn stop(&self) {
@@ -229,6 +235,7 @@ impl NetworkMonitor {
             let is_muted = muted.contains(&raw.id);
             let enriched = self.enricher.enrich(&raw.remote_ip, raw.remote_port);
 
+            let destination_tags = raw.remote_ip.parse().ok().and_then(|ip| self.destination_tags.lock().clone().map(|cache|cache.lookup(ip)));
             let stream = SocketStream {
                 id: raw.id,
                 protocol: raw.protocol,
@@ -237,6 +244,7 @@ impl NetworkMonitor {
                 local_port: raw.local_port,
                 remote_ip: raw.remote_ip,
                 remote_port: raw.remote_port,
+                destination_tags,
                 remote_host: enriched.host,
                 country_code: enriched.country_code,
                 country_name: enriched.country_name,
