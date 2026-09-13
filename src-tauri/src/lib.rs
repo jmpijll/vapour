@@ -177,7 +177,7 @@ pub fn run() {
             let feed_updater=protection::updater::FeedUpdater::new(
                 app.path().app_data_dir()?.join("protection").join("feodo-v1.json"),
             );
-            app.manage(protection::controller::ProtectionController::new(feed_updater.clone()));
+            app.manage(protection::controller::ProtectionController::new(feed_updater.clone(), app.path().app_data_dir()?.join("protection").join("threat-protection-intent.json")));
             app.manage(feed_updater);
             app.state::<protection::controller::ProtectionController>().start_updates()?;
             let handle = app.handle();
