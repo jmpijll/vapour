@@ -37,6 +37,7 @@ function AdapterDetailsView({item}: {item: InterfaceInfo}) {
       <dt>GUID</dt><dd>{d.interface_guid}</dd>
     </dl> : <p className="detail-note">Unavailable</p>}</details>
     {item.interface_type === "wifi" && <details><summary>Wi-Fi</summary><p className="detail-note">{item.wifi?.status || "Unavailable"}{item.wifi?.value && ` · ${item.wifi.value.status}`}</p>{item.wifi?.value && <><p className="detail-note">{item.wifi.value.phy_type || "Unknown PHY"}{item.wifi.value.is_mlo_connection ? " · MLO" : ""}</p>{item.wifi.value.links.map(link=><div className="adapter-route" key={link.link_id}>{link.center_frequency_khz/1000} MHz · {link.rssi_dbm} dBm</div>)}</>}</details>}
+    <details><summary>Driver</summary><p className="detail-note">{item.driver?.status || "Unavailable"}</p>{item.driver?.value && <dl><dt>Provider</dt><dd>{item.driver.value.provider || "—"}</dd><dt>Version</dt><dd>{item.driver.value.version || "—"}</dd><dt>Date</dt><dd>{item.driver.value.date || "—"}</dd></dl>}</details>
     <details><summary>IP configuration</summary><p className="detail-note">{item.ip_configuration_status || "Unavailable"}{ip && ` · ${new Date(ip.sampled_at).toLocaleTimeString()}`}</p>{ip && <dl>
       <dt>Addresses</dt><dd>{ip.addresses.map(a=><div key={`${a.address}/${a.prefix_length}`}>{a.address}/{a.prefix_length}</div>)}</dd>
       <dt>DNS</dt><dd>{ip.dns_servers.join(", ") || "—"}</dd>

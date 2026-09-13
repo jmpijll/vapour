@@ -35,6 +35,7 @@ pub struct NetworkMonitor {
     icon_extractor: Arc<IconExtractor>,
     if_history: Mutex<HashMap<u64, InterfaceDelta>>,
     ip_configuration: Arc<Mutex<super::ip_config::ConfigCache>>,
+    driver_cache: Arc<Mutex<super::driver_cache::DriverCache>>,
     wifi_cache: Arc<Mutex<super::wifi_cache::WifiCache>>,
     muted_streams: Mutex<HashSet<String>>,
     process_names_cache: Mutex<HashMap<u32, (String, String)>>,
@@ -49,6 +50,7 @@ impl NetworkMonitor {
             icon_extractor: Arc::new(IconExtractor::new()),
             if_history: Mutex::new(HashMap::new()),
             ip_configuration: Arc::new(Mutex::new(Default::default())),
+            driver_cache: Arc::new(Mutex::new(Default::default())),
             wifi_cache: Arc::new(Mutex::new(Default::default())),
             muted_streams: Mutex::new(HashSet::new()),
             process_names_cache: Mutex::new(HashMap::new()),
@@ -96,6 +98,8 @@ impl NetworkMonitor {
         let mut interfaces = Vec::new();
         let mut total_down = 0u64;
         let mut total_up = 0u64;
+        super::driver_cache::request(&self.driver_cache, now);
+        let driver_cache = self.driver_cache.lock();
         super::ip_config::request_refresh(&self.ip_configuration, now);
         let ip_configuration = self.ip_configuration.lock();
 
@@ -181,6 +185,7 @@ impl NetworkMonitor {
                         transmit_link_speed_bps: reported_link_speed(row.TransmitLinkSpeed, is_connected && if_type != 24),
                         is_default_gateway: None, // Interface type does not establish a default route.
                         details: super::adapter::details(row),
+                        driver: driver_cache.get(&format!("{:?}",row.InterfaceGuid),now),
                         wifi: (if_type == 71).then(||wifi_cache.get(&format!("{:?}",row.InterfaceGuid),is_connected,now)),
                         ip_configuration: config,
                         ip_configuration_status: config_status.into(),

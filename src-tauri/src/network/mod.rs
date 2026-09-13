@@ -19,3 +19,6 @@ pub mod routes;
 
 pub mod wifi_quality;
 pub mod wifi_cache;
+
+pub mod driver_details;
+pub mod driver_cache;

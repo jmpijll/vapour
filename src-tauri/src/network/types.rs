@@ -26,6 +26,7 @@ pub struct InterfaceInfo {
     pub transmit_link_speed_bps: Option<u64>,
     pub is_default_gateway: Option<bool>,
     pub details: super::adapter::AdapterDetails,
+    pub driver: super::driver_cache::DriverObservation,
     pub wifi: Option<super::wifi_cache::WifiObservation>,
     pub ip_configuration: Option<super::ip_config::IpConfiguration>,
     pub ip_configuration_status: String,

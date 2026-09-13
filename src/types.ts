@@ -22,6 +22,7 @@ export interface InterfaceInfo {
   transmit_link_speed_bps?: number | null;
   is_default_gateway: boolean | null;
   details?: AdapterDetails;
+  driver?: {status: string; sampled_at: number | null; value: {source: string; provider: string | null; version: string | null; date: string | null} | null};
   wifi?: {
     status: string; sampled_at: number | null;
     value: {
