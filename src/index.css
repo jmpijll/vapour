@@ -837,3 +837,14 @@ button.speedtest-server:disabled { cursor:default; }
 
 .capture-target {display:flex;align-items:center;gap:8px;color:var(--muted);font-size:12px;margin:0 0 16px;}
 .capture-target span {flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+
+.interface-stat { padding: 20px 0; border-bottom: 1px solid var(--border); }
+.interface-stat-heading { display: flex; gap: 10px; align-items: center; }
+.interface-stat-heading h2 { font-size: 14px; margin: 0 0 3px; }
+.interface-stat-heading .muted, .interface-description { font-size: 11px; }
+.interface-description { overflow-wrap: anywhere; margin: 12px 0 18px; }
+.interface-rates { display: flex; justify-content: space-between; gap: 10px; }
+.interface-rates .speed-value { font-size: 22px; }
+.interface-link { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 18px; font-size: 11px; }
+.interface-link > span { display: inline-flex; align-items: center; gap: 4px; }
+@media (max-width: 390px) { .titlebar { padding-inline: 12px; gap: 4px; } .toolbar { gap: 0; } .toolbar .icon-button { width: 27px; } .wordmark { gap: 6px; font-size: 14px; } }

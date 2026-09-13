@@ -17,6 +17,7 @@ import {
   RefreshCw,
   Gauge,
   Circle,
+  ChartNoAxesCombined,
 } from "lucide-react";
 import { useNetworkTelemetry } from "./hooks/useNetworkTelemetry";
 import { Capture } from "./components/Capture";
@@ -29,6 +30,7 @@ import { History } from "./components/History";
 import { Endpoint } from "./components/Endpoint";
 import { InterfacePicker } from "./components/InterfacePicker";
 import { Rate } from "./components/Rate";
+import { InterfaceStatistics } from "./components/InterfaceStatistics";
 import { Speedtest } from "./components/Speedtest";
 
 type Preferences = {
@@ -130,7 +132,7 @@ export function App() {
     [systemDark, setSystemDark] = useState(
       () => matchMedia("(prefers-color-scheme: dark)").matches,
     );
-  const [view, setView] = useState<"list" | "detail" | "settings" | "speedtest" | "capture" | "firewall">("list");
+  const [view, setView] = useState<"list" | "detail" | "settings" | "speedtest" | "capture" | "firewall" | "interfaces">("list");
   const [selected, setSelected] = useState<string | null>(null),
     [selectedApp, setSelectedApp] = useState<GroupedProcess | null>(null);
   const [query, setQuery] = useState(""),
@@ -301,6 +303,7 @@ export function App() {
           </button>
           <button className={"icon-button " + (capture.status.active ? "capture-recording" : "")} aria-label={capture.status.active ? "Capture recording" : "Capture"} title={capture.status.active ? "Capture recording" : "Capture"} onClick={()=>setView("capture")}><Circle size={16}/></button>
           <button className="icon-button" aria-label="Speedtest" title="Speedtest" onClick={()=>setView("speedtest")}><Gauge size={17}/></button>
+          <button className={"icon-button " + (view === "interfaces" ? "selected" : "")} aria-label="Interface statistics" title="Interfaces" onClick={() => setView(view === "interfaces" ? "list" : "interfaces")}><ChartNoAxesCombined size={17}/></button>
           <button className={"icon-button " + (view === "firewall" ? "selected" : "")} aria-label="Firewall" title="Firewall" aria-pressed={view === "firewall"} onClick={() => setView(view === "firewall" ? "list" : "firewall")}><ShieldCheck size={17}/></button>
           <button
             className={"icon-button " + (view === "settings" ? "selected" : "")}
@@ -675,6 +678,7 @@ export function App() {
         )}
         {view === "capture" && <Capture sessionAvailable={!capture.session||!!snapshot?.processes.some(p=>p.sockets.some(s=>s.id===capture.session?.socketId&&!s.closed_at&&s.state==="ESTABLISHED"))} appAvailable={captureAppAvailable} showUnavailable={prefs.showUnavailableInterfaces} capture={capture} networkInterfaces={snapshot?.interfaces||[]} back={()=>((capture.session||capture.appTarget)&&selected?setView("detail"):back())} elevated={firewall.elevated} elevate={()=>void firewall.elevate()}/> }
         {view === "speedtest" && <Speedtest back={back} />}
+        {view === "interfaces" && <InterfaceStatistics interfaces={snapshot?.interfaces || []} back={back}/>}
         {view === "firewall" && (
           <section className="settings-view view-enter">
             <div className="page-heading">

@@ -12,7 +12,7 @@ This is a direction, not a release schedule. Windows usability and measurement c
 ## Interface and workflow
 
 - Extend the dedicated Firewall page with validated protection sources.
-- Interface statistics: connection state, negotiated link speed and useful Wi-Fi signal information.
+- Extend interface statistics (connection state, traffic and reported link rates) with useful Wi-Fi signal information.
 - A global Basic / Advanced view, developed with concrete UI examples before committing to which controls belong in each mode.
 - Reliable destination tags with clear provenance and unknown states.
 

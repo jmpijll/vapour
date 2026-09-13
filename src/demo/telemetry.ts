@@ -20,6 +20,8 @@ export function generateMockSnapshot(): NetworkSnapshot {
         ipv6: null,
         download_speed_bps: Math.round(downBase),
         upload_speed_bps: Math.round(upBase),
+        receive_link_speed_bps: 1_200_000_000,
+        transmit_link_speed_bps: 1_200_000_000,
         is_default_gateway: true,
       },
     ],

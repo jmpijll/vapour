@@ -22,6 +22,8 @@ pub struct InterfaceInfo {
     pub ipv6: Option<String>,
     pub download_speed_bps: u64,
     pub upload_speed_bps: u64,
+    pub receive_link_speed_bps: Option<u64>,
+    pub transmit_link_speed_bps: Option<u64>,
     pub is_default_gateway: bool,
 }
 

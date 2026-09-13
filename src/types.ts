@@ -18,6 +18,8 @@ export interface InterfaceInfo {
   ipv6?: string | null;
   download_speed_bps: number;
   upload_speed_bps: number;
+  receive_link_speed_bps?: number | null;
+  transmit_link_speed_bps?: number | null;
   is_default_gateway: boolean;
 }
 

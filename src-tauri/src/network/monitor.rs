@@ -165,6 +165,8 @@ impl NetworkMonitor {
                         ipv6: None,
                         download_speed_bps: down_bps,
                         upload_speed_bps: up_bps,
+                        receive_link_speed_bps: reported_link_speed(row.ReceiveLinkSpeed, is_connected && if_type != 24),
+                        transmit_link_speed_bps: reported_link_speed(row.TransmitLinkSpeed, is_connected && if_type != 24),
                         is_default_gateway: if_type == 71 || if_type == 6,
                     });
                 }
@@ -703,4 +705,21 @@ fn sample_udp_v6() -> Vec<RawSocketRow> {
 /// Fresh ownership table check, without sampling throughput or retaining closed sockets.
 pub fn established_socket_exists(id: &str) -> bool {
     sample_tcp_v4().into_iter().chain(sample_tcp_v6()).any(|s|s.id==id && s.state=="ESTABLISHED")
+}
+
+// Link rates are bits/second, unlike the throughput byte counters.
+fn reported_link_speed(value: u64, connected: bool) -> Option<u64> {
+    (connected && value > 0 && value != u64::MAX).then_some(value)
+}
+
+#[cfg(test)]
+mod link_speed_tests {
+    use super::reported_link_speed;
+    #[test]
+    fn excludes_disconnected_and_unknown_link_rates() {
+        assert_eq!(reported_link_speed(1_000_000_000, true), Some(1_000_000_000));
+        assert_eq!(reported_link_speed(100_000_000, false), None);
+        assert_eq!(reported_link_speed(0, true), None);
+        assert_eq!(reported_link_speed(u64::MAX, true), None);
+    }
 }
