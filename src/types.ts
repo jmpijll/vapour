@@ -20,7 +20,8 @@ export interface InterfaceInfo {
   upload_speed_bps: number;
   receive_link_speed_bps?: number | null;
   transmit_link_speed_bps?: number | null;
-  is_default_gateway: boolean;
+  is_default_gateway: boolean | null;
+  details?: AdapterDetails;
 }
 
 export interface ProcessTraffic {
@@ -60,4 +61,31 @@ export interface SocketStream {
   is_muted: boolean;
   download_speed_bps: number;
   upload_speed_bps: number;
+}
+
+export interface AdapterDetails {
+  source: "windows_mib_if_row2";
+  interface_guid: string;
+  interface_index: number;
+  mtu_bytes: number | null;
+  operational_status: "up" | "down" | "testing" | "unknown" | "dormant" | "not_present" | "lower_layer_down";
+  administrative_status: "up" | "down" | "testing" | "unknown";
+  media_state: "connected" | "disconnected" | "unknown";
+  interface_type_code: number;
+  physical_medium_code: number;
+  tunnel_type_code: number;
+  hardware_interface: boolean;
+  connector_present: boolean;
+  filter_interface: boolean;
+  paused: boolean;
+  low_power: boolean;
+  /** Driver lifetime totals; decimal strings preserve 64-bit precision. */
+  counters: {
+    received_bytes: string; sent_bytes: string;
+    received_unicast_packets: string; sent_unicast_packets: string;
+    received_non_unicast_packets: string; sent_non_unicast_packets: string;
+    receive_errors: string; transmit_errors: string;
+    receive_discards: string; transmit_discards: string;
+    unknown_protocol_packets: string;
+  };
 }

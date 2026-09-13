@@ -24,7 +24,8 @@ pub struct InterfaceInfo {
     pub upload_speed_bps: u64,
     pub receive_link_speed_bps: Option<u64>,
     pub transmit_link_speed_bps: Option<u64>,
-    pub is_default_gateway: bool,
+    pub is_default_gateway: Option<bool>,
+    pub details: super::adapter::AdapterDetails,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

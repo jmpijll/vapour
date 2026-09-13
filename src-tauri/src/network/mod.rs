@@ -10,3 +10,5 @@ pub mod usage;
 pub mod destinations;
 
 mod trace_cleanup;
+
+pub mod adapter;

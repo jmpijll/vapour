@@ -167,7 +167,8 @@ impl NetworkMonitor {
                         upload_speed_bps: up_bps,
                         receive_link_speed_bps: reported_link_speed(row.ReceiveLinkSpeed, is_connected && if_type != 24),
                         transmit_link_speed_bps: reported_link_speed(row.TransmitLinkSpeed, is_connected && if_type != 24),
-                        is_default_gateway: if_type == 71 || if_type == 6,
+                        is_default_gateway: None, // Interface type does not establish a default route.
+                        details: super::adapter::details(row),
                     });
                 }
 
