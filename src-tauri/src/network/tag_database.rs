@@ -71,6 +71,20 @@ impl DbIpRelease {
         Ok(release)
     }
 
+    /// Return the DB-IP release corresponding to the current UTC calendar
+    /// month.  This uses the system clock only; no network request is made.
+    pub fn current_utc() -> Result<Self, TagDatabaseError> {
+        let elapsed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| TagDatabaseError::SystemClockUnavailable)?;
+        let days = i64::try_from(elapsed.as_secs() / 86_400)
+            .map_err(|_| TagDatabaseError::SystemClockUnavailable)?;
+        let (year, month, _) = civil_from_days(days);
+        let year = u16::try_from(year).map_err(|_| TagDatabaseError::SystemClockUnavailable)?;
+        let month = u8::try_from(month).map_err(|_| TagDatabaseError::SystemClockUnavailable)?;
+        Self::new(year, month)
+    }
+
     pub fn year(self) -> u16 {
         self.year
     }
@@ -130,6 +144,23 @@ impl std::str::FromStr for DbIpRelease {
             .map_err(|_| TagDatabaseError::InvalidReleaseFormat)?;
         Self::new(year, month)
     }
+}
+
+// Convert a signed count of days since 1970-01-01 to a proleptic Gregorian
+// calendar date.  Keeping this conversion local avoids adding a clock/date
+// dependency to the updater and makes the UTC boundary behavior testable.
+fn civil_from_days(days_since_unix_epoch: i64) -> (i64, u8, u8) {
+    let z = days_since_unix_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let month_part = (5 * doy + 2) / 153;
+    let day = doy - (153 * month_part + 2) / 5 + 1;
+    let month = month_part + if month_part < 10 { 3 } else { -9 };
+    let year = year + i64::from(month <= 2);
+    (year, month as u8, day as u8)
 }
 
 /// Limits for HTTP retrieval and local gzip processing.
@@ -263,6 +294,7 @@ pub enum TagDatabaseError {
     InvalidConfig {
         field: &'static str,
     },
+    SystemClockUnavailable,
     HttpClient,
     HttpRequest,
     HttpStatus {
@@ -307,6 +339,9 @@ impl fmt::Display for TagDatabaseError {
             }
             Self::InvalidReleaseFormat => f.write_str("DB-IP release must use YYYY-MM format"),
             Self::InvalidConfig { field } => write!(f, "invalid tag database setting: {field}"),
+            Self::SystemClockUnavailable => {
+                f.write_str("the system clock could not provide the current UTC release")
+            }
             Self::HttpClient => f.write_str("could not create the DB-IP HTTPS client"),
             Self::HttpRequest => f.write_str("DB-IP download request failed"),
             Self::HttpStatus { status } => write!(f, "DB-IP download returned HTTP {status}"),
@@ -412,6 +447,12 @@ impl TagDatabase {
         let country = self.fetch_gzip_csv(&client, &country_url)?;
         let asn = self.fetch_gzip_csv(&client, &asn_url)?;
         self.install_csv_bytes(release, &country, &asn)
+    }
+
+    /// Refresh the current UTC DB-IP monthly release.  Call this from a
+    /// background worker because the underlying HTTP client is blocking.
+    pub fn refresh_current(&self) -> Result<DatasetSnapshot, TagDatabaseError> {
+        self.refresh(DbIpRelease::current_utc()?)
     }
 
     /// Install two already decompressed local CSV artifacts and publish them
@@ -1061,6 +1102,21 @@ mod tests {
         );
         assert!("2026-09".parse::<DbIpRelease>().is_ok());
         assert!("2026-13".parse::<DbIpRelease>().is_err());
+    }
+
+    #[test]
+    fn current_release_uses_the_utc_calendar() {
+        let current = DbIpRelease::current_utc().expect("system clock should be available");
+        assert!((2000..=2100).contains(&current.year()));
+        assert!((1..=12).contains(&current.month()));
+    }
+
+    #[test]
+    fn unix_days_convert_to_expected_calendar_dates() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(-1), (1969, 12, 31));
+        assert_eq!(civil_from_days(10_957), (2000, 1, 1));
+        assert_eq!(civil_from_days(18_262), (2020, 1, 1));
     }
 
     #[test]
