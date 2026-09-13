@@ -25,14 +25,25 @@ pub struct AppState {
 }
 
 #[tauri::command]
+async fn get_threat_protection_status(controller: State<'_, protection::controller::ProtectionController>) -> Result<protection::controller::ProtectionStatus, String> {
+    let controller=controller.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || controller.status()).await.map_err(|e|e.to_string())?
+}
+#[tauri::command]
+async fn set_threat_protection(controller: State<'_, protection::controller::ProtectionController>, enabled: bool) -> Result<protection::controller::ProtectionStatus, String> {
+    let controller=controller.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || controller.set_enabled(enabled)).await.map_err(|e|e.to_string())?
+}
+
+#[tauri::command]
 fn get_threat_feed_status(updater: State<'_, protection::updater::FeedUpdater>) -> protection::updater::UpdateStatus {
     updater.status()
 }
 
 #[tauri::command]
-fn refresh_threat_feed(updater: State<'_, protection::updater::FeedUpdater>) -> protection::updater::UpdateStatus {
-    updater.request(true);
-    updater.status()
+async fn refresh_threat_feed(controller: State<'_, protection::controller::ProtectionController>) -> Result<protection::controller::ProtectionStatus, String> {
+    let controller=controller.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || controller.refresh()).await.map_err(|e|e.to_string())?
 }
 
 #[tauri::command]
@@ -142,6 +153,7 @@ fn restart_as_administrator(app: tauri::AppHandle) -> Result<(), String> {
     if result.0 as isize <= 32 {
         return Err("Administrator restart was cancelled or unavailable.".into());
     }
+    app.state::<protection::controller::ProtectionController>().stop();
     app.state::<capture::CaptureManager>().stop();
     app.state::<AppState>().monitor.stop();
     app.exit(0);
@@ -162,9 +174,12 @@ pub fn run() {
         .manage(capture::CaptureManager::default())
         .manage(state)
         .setup(move |app| {
-            app.manage(protection::updater::FeedUpdater::new(
+            let feed_updater=protection::updater::FeedUpdater::new(
                 app.path().app_data_dir()?.join("protection").join("feodo-v1.json"),
-            ));
+            );
+            app.manage(protection::controller::ProtectionController::new(feed_updater.clone()));
+            app.manage(feed_updater);
+            app.state::<protection::controller::ProtectionController>().start_updates()?;
             let handle = app.handle();
 
             // Load embedded icon
@@ -199,7 +214,8 @@ pub fn run() {
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| {
                     if event.id.as_ref() == "quit" {
-                        app.state::<capture::CaptureManager>().stop();
+                        app.state::<protection::controller::ProtectionController>().stop();
+    app.state::<capture::CaptureManager>().stop();
                         app.state::<AppState>().monitor.stop();
                         app.exit(0);
                     } else if event.id.as_ref() == "toggle" {
@@ -287,6 +303,7 @@ pub fn run() {
         })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {
+                window.state::<protection::controller::ProtectionController>().stop();
                 window.state::<capture::CaptureManager>().stop();
                 window.state::<AppState>().monitor.stop();
             }
@@ -318,6 +335,8 @@ pub fn run() {
             set_appearance,
             list_blocks,
             get_firewall_environment,
+            get_threat_protection_status,
+            set_threat_protection,
             get_threat_feed_status,
             refresh_threat_feed,
             set_block,

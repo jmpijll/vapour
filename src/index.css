@@ -868,3 +868,5 @@ button.speedtest-server:disabled { cursor:default; }
 .wifi-quality meter { width: 70px; height: 7px; }
 .wifi-quality meter::-webkit-meter-bar { background: var(--border); border: none; }
 .wifi-quality meter::-webkit-meter-optimum-value { background: var(--muted); }
+
+.threat-protection{margin-bottom:24px}.threat-protection h2,.threat-actions{display:flex;align-items:center;gap:10px}

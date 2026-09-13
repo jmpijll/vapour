@@ -28,3 +28,16 @@ for (const theme of ["light", "dark"]) {
     await expect(page.getByText("Diagnostics",{exact:true})).toBeVisible();
   });
 }
+
+test("Threat protection exposes an accessible switch without Basic source details",async({page})=>{
+  await page.goto("/");
+  await page.getByRole("button",{name:"Firewall",exact:true}).click();
+  const toggle=page.getByRole("switch",{name:"Threat protection",exact:true});
+  await expect(toggle).toHaveAttribute("aria-checked","false");
+  await expect(page.getByText(/Feodo Tracker/)).toBeHidden();
+  await toggle.focus();await page.keyboard.press("Space");
+  await expect(toggle).toHaveAttribute("aria-checked","true");
+  await page.getByRole("button",{name:"Advanced mode",exact:true}).click();
+  await expect(page.getByText(/Feodo Tracker/)).toBeVisible();
+  await expect(toggle).toHaveAttribute("aria-checked","true");
+});

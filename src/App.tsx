@@ -32,6 +32,7 @@ import { Endpoint } from "./components/Endpoint";
 import { InterfacePicker } from "./components/InterfacePicker";
 import { Rate } from "./components/Rate";
 import { InterfaceStatistics } from "./components/InterfaceStatistics";
+import { ThreatProtection } from "./components/ThreatProtection";
 import { Speedtest } from "./components/Speedtest";
 
 type Preferences = {
@@ -691,6 +692,7 @@ export function App() {
               <button className="back-button" onClick={back} aria-label="Back" title="Back"><ArrowLeft size={15}/></button>
               <h1>Firewall</h1>
             </div>
+            <ThreatProtection elevated={firewall.elevated} elevate={()=>void firewall.elevate()}/>
             <div className="blocks-heading">
               <h2>Blocks</h2>
               <button

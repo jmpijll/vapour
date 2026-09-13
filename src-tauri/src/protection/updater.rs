@@ -20,6 +20,7 @@ pub struct UpdateStatus {
     pub endpoint_count: usize,
     pub last_error: Option<String>,
 }
+#[derive(Clone)]
 pub struct FeedUpdater {
     path: PathBuf,
     state: Arc<Mutex<State>>,
