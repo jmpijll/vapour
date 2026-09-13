@@ -1,4 +1,21 @@
 import { test, expect } from "@playwright/test";
+
+test("Destination tags stay compact and unknown destinations do not gain labels", async ({page}) => {
+  await page.goto("/");
+  await page.locator(".process-row").filter({hasText: "Chrome"}).click();
+  const endpoint = page.locator(".endpoint").filter({hasText: "video.google.com"});
+  await expect(endpoint.getByText("Google LLC", {exact: true})).toBeVisible();
+  await expect(endpoint.getByText("US", {exact: true})).toBeVisible();
+  await expect(endpoint.getByText("AS15169", {exact: true})).toBeHidden();
+  await page.getByRole("button", {name: "Advanced mode", exact: true}).click();
+  await expect(endpoint.getByText("AS15169", {exact: true})).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  await page.locator(".back-button").click();
+  await page.locator(".process-row").filter({hasText: "Discord"}).click();
+  await expect(page.locator(".endpoint")).toHaveCount(1);
+  await expect(page.locator(".destination-tag")).toHaveCount(0);
+});
+
 for (const theme of ["light", "dark"]) {
   test(`Basic/Advanced persists and changes detail visibility in ${theme}`, async ({page}) => {
     await page.addInitScript(theme => {
