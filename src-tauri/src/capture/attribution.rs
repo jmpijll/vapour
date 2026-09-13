@@ -21,7 +21,7 @@ impl Flow {
             && !self.local.ip().is_unspecified() && !self.remote.ip().is_unspecified()
             && self.local.is_ipv4() == self.remote.is_ipv4()
     }
-    fn matches(&self, other: &Self) -> bool {
+    pub(super) fn matches(&self, other: &Self) -> bool {
         self.protocol == other.protocol
             && ((self.local == other.local && self.remote == other.remote)
                 || (self.local == other.remote && self.remote == other.local))
@@ -218,6 +218,63 @@ mod tests {
         second.flow.remote = "127.0.0.1:40002".parse().unwrap();
         assert!(l.ingest(second));
         assert_eq!(l.classify(&second.flow, 12, server), Verdict::Selected);
+    }
+    #[test]
+    fn inbound_udp_server_event_matches_reverse_packet() {
+        let server = id(200);
+        let event_flow = Flow {
+            protocol: 17,
+            local: "192.0.2.2:5353".parse().unwrap(),
+            remote: "192.0.2.1:53000".parse().unwrap(),
+        };
+        let packet_flow = Flow {
+            protocol: 17,
+            local: event_flow.remote,
+            remote: event_flow.local,
+        };
+        let mut l = Ledger::new(8);
+        assert!(l.ingest(Event {
+            timestamp_qpc: 10,
+            endpoint_id: 20,
+            owner: server,
+            flow: event_flow,
+            kind: EventKind::Established,
+        }));
+        assert_eq!(l.classify(&packet_flow, 11, server), Verdict::Selected);
+        assert_eq!(l.classify(&packet_flow, 11, id(100)), Verdict::Other);
+    }
+    #[test]
+    fn preexisting_flow_without_a_capture_event_stays_unknown() {
+        let flow = Flow {
+            protocol: 6,
+            local: "192.0.2.1:40000".parse().unwrap(),
+            remote: "192.0.2.2:443".parse().unwrap(),
+        };
+        let l = Ledger::new(8);
+        assert_eq!(l.classify(&flow, 11, id(100)), Verdict::Unknown);
+    }
+    #[test]
+    fn inbound_ipv6_event_matches_reverse_packet() {
+        let server = id(200);
+        let event_flow = Flow {
+            protocol: 6,
+            local: "[2001:db8::2]:443".parse().unwrap(),
+            remote: "[2001:db8::1]:40000".parse().unwrap(),
+        };
+        let packet_flow = Flow {
+            protocol: 6,
+            local: event_flow.remote,
+            remote: event_flow.local,
+        };
+        let mut l = Ledger::new(8);
+        assert!(l.ingest(Event {
+            timestamp_qpc: 10,
+            endpoint_id: 21,
+            owner: server,
+            flow: event_flow,
+            kind: EventKind::Accept,
+        }));
+        assert_eq!(l.classify(&packet_flow, 11, server), Verdict::Selected);
     }
     #[test]
     fn udp_and_ipv6_use_the_same_evidence_boundary() {

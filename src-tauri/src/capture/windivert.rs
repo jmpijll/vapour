@@ -62,21 +62,29 @@ fn identity(pid:u32)->Option<Identity>{
  use windows::Win32::{Foundation::{CloseHandle,FILETIME},System::Threading::*};
  unsafe{let h=OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,false,pid).ok()?;let(mut c,mut e,mut k,mut u)=(FILETIME::default(),FILETIME::default(),FILETIME::default(),FILETIME::default());let ok=GetProcessTimes(h,&mut c,&mut e,&mut k,&mut u).is_ok();let _=CloseHandle(h);ok.then_some(Identity{pid,creation_time_100ns:((c.dwHighDateTime as u64)<<32)|c.dwLowDateTime as u64})}
 }
+fn qpc_to_filetime(qpc:i64,anchor:i64,filetime:i64,frequency:u64)->Option<u64>{
+ if frequency==0{return None;}
+ let value=filetime as i128+(qpc as i128-anchor as i128)*10_000_000/frequency as i128;
+ u64::try_from(value).ok()
+}
+fn identity_is_valid_at(owner:Identity,event_qpc:i64,anchor:i64,filetime:i64,frequency:u64)->bool{
+ owner.creation_time_100ns!=0&&event_qpc>=0&&qpc_to_filetime(event_qpc,anchor,filetime,frequency).is_some_and(|event_time|owner.creation_time_100ns<=event_time)
+}
 fn ip(api:&Api,data:&[u8])->Option<IpAddr>{
  let mut words=[0u32;4];for(i,w)in words.iter_mut().enumerate(){*w=u32::from_ne_bytes(data.get(i*4..i*4+4)?.try_into().ok()?);}
  let mut out=[0i8;128];if unsafe{(api.format)(words.as_ptr(),out.as_mut_ptr(),128)}==0{return None;}
  let value:IpAddr=unsafe{CStr::from_ptr(out.as_ptr())}.to_str().ok()?.parse().ok()?;
  Some(match value {IpAddr::V6(v)=>v.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(v)),other=>other})
 }
-fn event(api:&Api,address:Address,cache:&mut HashMap<(u64,u32),Identity>)->Option<Event>{
+fn event(api:&Api,address:Address,cache:&mut HashMap<(u64,u32),Identity>,anchor:i64,filetime:i64,frequency:u64)->Option<Event>{
  let layer=address.bits&255;let kind=match(layer,(address.bits>>8)&255){(2,1)=>EventKind::Established,(2,2)=>EventKind::Deleted,(3,4)=>EventKind::Connect,(3,6)=>EventKind::Accept,(3,7)=>EventKind::Close,_=>return None};
  let d=address.data;let endpoint=u64::from_ne_bytes(d[0..8].try_into().ok()?);let pid=u32::from_ne_bytes(d[16..20].try_into().ok()?);
  let local=SocketAddr::new(ip(api,&d[20..36])?,u16::from_ne_bytes(d[52..54].try_into().ok()?));
  let remote=SocketAddr::new(ip(api,&d[36..52])?,u16::from_ne_bytes(d[54..56].try_into().ok()?));
  if !matches!(d[56],6|17)||local.port()==0||remote.port()==0||local.ip().is_unspecified()||remote.ip().is_unspecified(){return None;}
- let current=identity(pid);
+ let current=identity(pid).filter(|owner|identity_is_valid_at(*owner,address.timestamp,anchor,filetime,frequency));
  // Only endpoint-bound closure evidence may use an identity recorded while alive.
- let owner=current.or_else(||matches!(kind,EventKind::Close|EventKind::Deleted).then(||cache.get(&(endpoint,pid)).copied()).flatten()).unwrap_or(Identity{pid,creation_time_100ns:0});
+ let owner=current.or_else(||matches!(kind,EventKind::Close|EventKind::Deleted).then(||cache.get(&(endpoint,pid)).copied()).flatten().filter(|owner|identity_is_valid_at(*owner,address.timestamp,anchor,filetime,frequency))).unwrap_or(Identity{pid,creation_time_100ns:0});
  if owner.creation_time_100ns!=0{cache.insert((endpoint,pid),owner);}
  Some(Event{timestamp_qpc:address.timestamp,endpoint_id:endpoint,owner,flow:Flow{protocol:d[56],local,remote},kind})
 }
@@ -116,7 +124,7 @@ pub fn collect(dll:&Path,cancel:&AtomicBool,max_seconds:u64,ready:SyncSender<Res
  let mut result=Collection{packets:Vec::new(),events:Vec::new(),qpc_frequency:frequency as u64,qpc_anchor:anchor,filetime_anchor:filetime as i64};let mut cache=HashMap::new();let started=Instant::now();
  let mut receive=|message|->Result<(),String>{match message{Message::Packet(at,bytes)=>result.packets.push((at,bytes)),Message::Metadata(address)=>{
   if result.events.len()>=20_000{return Err("Capture metadata limit reached".into());}
-  if let Some(e)=event(&api,address,&mut cache){result.events.push(e);}
+  if let Some(e)=event(&api,address,&mut cache,anchor,filetime as i64,frequency as u64){result.events.push(e);}
  }}Ok(())};
  let mut processing_error=None;
  while !cancel.load(Ordering::Acquire)&&started.elapsed()<Duration::from_secs(bounded_seconds(max_seconds))&&!failed.load(Ordering::Acquire){
@@ -132,7 +140,7 @@ pub fn collect(dll:&Path,cancel:&AtomicBool,max_seconds:u64,ready:SyncSender<Res
  if failed.load(Ordering::Acquire){return Err("Capture lost data or reached its memory limit; recording discarded".into());}
  Ok(result)
 }
-#[cfg(test)]mod tests{#[test]fn max_seconds_is_bounded(){assert_eq!(super::bounded_seconds(90),60);assert_eq!(super::bounded_seconds(0),1);}#[test]fn address_abi_matches_native(){assert_eq!(std::mem::size_of::<super::Address>(),80);}}
+#[cfg(test)]mod tests{use super::super::attribution::Identity;#[test]fn max_seconds_is_bounded(){assert_eq!(super::bounded_seconds(90),60);assert_eq!(super::bounded_seconds(0),1);}#[test]fn address_abi_matches_native(){assert_eq!(std::mem::size_of::<super::Address>(),80);}#[test]fn qpc_identity_check_rejects_a_pid_created_after_the_event(){let owner=Identity{pid:7,creation_time_100ns:999};assert!(super::identity_is_valid_at(owner,100,100,1_000,10_000_000));assert!(!super::identity_is_valid_at(owner,98,100,1_000,10_000_000));assert!(!super::identity_is_valid_at(Identity{creation_time_100ns:1_001,..owner},100,100,1_000,10_000_000));}}
 
 #[cfg(test)] mod lifecycle_tests {
  use super::*;

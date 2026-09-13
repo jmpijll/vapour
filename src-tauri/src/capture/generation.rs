@@ -25,11 +25,12 @@ impl Generations {
         let mut result = Vec::new();
         let mut endpoints = Vec::new();
         for e in &self.events {
-            if e.flow != flow || e.timestamp_qpc > at
+            // A late ACCEPT cannot retroactively authorize an earlier SYN.
+            if !e.flow.matches(&flow) || e.timestamp_qpc > at
                 || !matches!(e.kind, EventKind::Connect | EventKind::Accept)
                 || e.owner.pid == 0 || e.owner.creation_time_100ns == 0 || e.endpoint_id == 0 { continue; }
             if self.events.iter().any(|c| c.endpoint_id == e.endpoint_id && c.timestamp_qpc <= at
-                && (c.owner != e.owner || c.flow != e.flow
+                && (c.owner != e.owner || !c.flow.matches(&e.flow)
                     || matches!(c.kind, EventKind::Close | EventKind::Deleted))) { continue; }
             if !endpoints.contains(&(e.endpoint_id, e.owner)) {
                 endpoints.push((e.endpoint_id, e.owner)); result.push(e.owner);
@@ -54,7 +55,7 @@ impl Generations {
                 // A repeated ISN cannot distinguish retransmission from reuse.
                 self.poison(packet.flow); return Verdict::Ambiguous;
             }
-            let opening = self.events.iter().filter(|e| e.flow == packet.flow
+            let opening = self.events.iter().filter(|e| e.flow.matches(&packet.flow)
                 && e.owner == owners[0] && e.timestamp_qpc <= packet.at
                 && matches!(e.kind, EventKind::Connect | EventKind::Accept))
                 .map(|e| e.timestamp_qpc).max().unwrap_or(-1);
@@ -140,6 +141,72 @@ mod tests {
         let mut g = Generations::new(vec![], 8);
         assert_eq!(g.classify(p(11,10,0,2,false),id(100)),Verdict::Unknown);
         assert_eq!(g.classify(p(12,11,51,16,false),id(100)),Verdict::Unknown);
+    }
+    #[test]
+    fn inbound_syn_is_attributed_to_verified_accept_owner() {
+        let mut server = event(10,200,EventKind::Accept);
+        server.flow = Flow { protocol: 6,
+            local: "127.0.0.1:42000".parse().unwrap(),
+            remote: "127.0.0.1:41000".parse().unwrap() };
+        let mut g = Generations::new(vec![server], 8);
+        assert_eq!(g.classify(p(11,10,0,2,false),id(200)),Verdict::Selected);
+        assert_eq!(g.classify(p(12,50,11,18,true),id(200)),Verdict::Selected);
+        assert_eq!(g.classify(p(13,11,51,16,false),id(200)),Verdict::Selected);
+    }
+    #[test]
+    fn inbound_ipv6_syn_is_attributed_to_verified_accept_owner() {
+        let server_flow = Flow { protocol: 6,
+            local: "[2001:db8::2]:443".parse().unwrap(),
+            remote: "[2001:db8::1]:41000".parse().unwrap() };
+        let client_flow = Flow { protocol: 6,
+            local: server_flow.remote, remote: server_flow.local };
+        let server = Event { timestamp_qpc: 10, endpoint_id: 201,
+            owner: id(200), flow: server_flow, kind: EventKind::Accept };
+        let mut g = Generations::new(vec![server], 8);
+        assert_eq!(g.classify(Packet { flow: client_flow, at: 11,
+            seq: 10, ack: 0, flags: 2, payload: 0 }, id(200)), Verdict::Selected);
+        assert_eq!(g.classify(Packet { flow: server_flow, at: 12,
+            seq: 50, ack: 11, flags: 18, payload: 0 }, id(200)), Verdict::Selected);
+        assert_eq!(g.classify(Packet { flow: client_flow, at: 13,
+            seq: 11, ack: 51, flags: 16, payload: 0 }, id(200)), Verdict::Selected);
+    }
+    #[test]
+    fn same_owner_different_endpoint_ids_without_close_stay_unknown() {
+        let mut first = event(10, 100, EventKind::Connect);
+        first.endpoint_id = 100;
+        let mut second = event(30, 100, EventKind::Connect);
+        second.endpoint_id = 101;
+        let mut g = Generations::new(vec![first, second], 8);
+        assert_eq!(g.classify(p(31, 200, 0, 2, false), id(100)), Verdict::Unknown);
+    }
+    #[test]
+    fn old_close_before_new_endpoint_opening_allows_distinct_isn() {
+        let old = event(10, 100, EventKind::Connect);
+        let old_close = event(20, 100, EventKind::Close);
+        let mut new = event(30, 100, EventKind::Connect);
+        new.endpoint_id = 101;
+        // Deliberately out of timestamp order, as metadata can be queued this way.
+        let mut g = Generations::new(vec![new, old_close, old], 8);
+        assert_eq!(g.classify(p(11, 10, 0, 2, false), id(100)), Verdict::Selected);
+        assert_eq!(g.classify(p(31, 200, 0, 2, false), id(100)), Verdict::Selected);
+    }
+    #[test]
+    fn delayed_old_close_keeps_same_owner_endpoint_reuse_ambiguous() {
+        let old = event(10, 100, EventKind::Connect);
+        let mut new = event(30, 100, EventKind::Connect);
+        new.endpoint_id = 101;
+        let old_close = event(40, 100, EventKind::Close);
+        let mut g = Generations::new(vec![new, old_close, old], 8);
+        assert_eq!(g.classify(p(31, 200, 0, 2, false), id(100)), Verdict::Unknown);
+    }
+    #[test]
+    fn accept_after_inbound_syn_does_not_retroactively_authorize_it() {
+        let mut server = event(20, 200, EventKind::Accept);
+        server.flow = Flow { protocol: 6,
+            local: "127.0.0.1:42000".parse().unwrap(),
+            remote: "127.0.0.1:41000".parse().unwrap() };
+        let mut g = Generations::new(vec![server], 8);
+        assert_eq!(g.classify(p(11, 10, 0, 2, false), id(200)), Verdict::Unknown);
     }
     #[test]
     fn app_group_matches_any_verified_identity_once_per_packet() {
