@@ -250,7 +250,7 @@ fn read_bounded(path: &Path) -> Result<Option<Vec<u8>>, CacheError> {
     Ok(Some(bytes))
 }
 
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), CacheError> {
+pub(super) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), CacheError> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())

@@ -1,6 +1,13 @@
-pub mod feeds;
 pub mod cache;
-pub mod download;
-pub mod updater;
-pub mod enforcement;
 pub mod controller;
+pub mod dns_cache;
+pub mod dns_configuration;
+pub mod dns_process;
+pub mod dns_storage;
+pub mod dns_updater;
+pub mod dns_watchdog;
+pub(crate) mod dns_watchdog_cli;
+pub mod download;
+pub mod enforcement;
+pub mod feeds;
+pub mod updater;

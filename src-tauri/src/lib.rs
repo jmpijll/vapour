@@ -351,3 +351,7 @@ mod speedtest;
 
 pub mod capture;
 mod capture_commands;
+/// Dispatch internal helpers before starting the UI runtime.
+pub fn run_internal_cli() -> Option<i32> {
+    protection::dns_watchdog_cli::dispatch(&std::env::args_os().skip(1).collect::<Vec<_>>())
+}
