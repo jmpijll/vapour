@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Copy, Check, ShieldBan, Circle } from "lucide-react";
+import { Copy, Check, ShieldBan, Circle, Globe, Building2 } from "lucide-react";
 import type { SocketStream } from "../types";
 export function Endpoint({
   socket,
@@ -31,6 +31,7 @@ export function Endpoint({
           ? "[" + socket.remote_ip + "]"
           : socket.remote_ip) +
         (socket.remote_port ? ":" + socket.remote_port : "");
+  const tags = socket.destination_tags?.status === "known" ? socket.destination_tags.tags : null;
   const copy = async () => {
     try {
       await navigator.clipboard.writeText(address);
@@ -80,6 +81,9 @@ export function Endpoint({
         {socket.remote_host && socket.remote_host !== socket.remote_ip && <span className="endpoint-ip">{address}</span>}
         <span>{socket.state.toLowerCase().replaceAll("_", " ")}</span>
         <span className="advanced-only">{socket.local_ip}:{socket.local_port}</span>
+        {tags?.country_code && <span className="destination-tag" title={tags.country_name || "IP registration country"}><Globe size={11}/>{tags.country_code}</span>}
+        {tags?.organization && <span className="destination-tag destination-organization" title={"Network operator · " + tags.organization}><Building2 size={11}/>{tags.organization}</span>}
+        {tags?.asn != null && <span className="advanced-only" title={socket.destination_tags?.source || "Offline dataset"}>AS{tags.asn}</span>}
         {error && <span role="status">Select address to copy</span>}
       </div>
     </div>

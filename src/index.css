@@ -870,3 +870,5 @@ button.speedtest-server:disabled { cursor:default; }
 .wifi-quality meter::-webkit-meter-optimum-value { background: var(--muted); }
 
 .threat-protection{margin-bottom:24px}.threat-protection h2,.threat-actions{display:flex;align-items:center;gap:10px}
+
+.destination-tag{display:inline-flex;align-items:center;gap:4px}.destination-organization{max-width:170px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}

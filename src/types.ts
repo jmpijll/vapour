@@ -76,6 +76,7 @@ export interface SocketStream {
   remote_ip: string;
   remote_port: number;
   remote_host?: string | null;
+  destination_tags?: {status: "known" | "unknown" | "unavailable" | "private" | "special"; source: string | null; tags: {country_code:string|null;country_name:string|null;organization:string|null;asn:number|null}|null} | null;
   country_code?: string | null;
   country_name?: string | null;
   cloud_provider?: string | null;
