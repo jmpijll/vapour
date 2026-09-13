@@ -229,7 +229,9 @@ func validateConfig(input config) (config, error) {
 	if len([]byte(input.Rules)) > maxRuleTextBytes {
 		return config{}, fmt.Errorf("rules exceed %d bytes", maxRuleTextBytes)
 	}
-	if _, err := newDomainEngine(input.Rules); err != nil {
+	// Validate syntax here; start builds the lookup index once after all
+	// configuration checks pass. Building it here would discard a full index.
+	if err := validateRules(input.Rules); err != nil {
 		return config{}, err
 	}
 

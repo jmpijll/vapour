@@ -105,6 +105,14 @@ IP firewall rules would create false blocks and is outside this companion.
 
 ## Tests
 
+For an explicit startup benchmark, set `VAPOUR_ADGUARD_FILTER` to a local copy
+of the official list and run `go test -run '^$' -bench BenchmarkOfficialFilterStartup
+-benchtime=3x -benchmem` on one command line. It binds ephemeral loopback ports
+without sending DNS requests. A local Windows comparison with 179,077 rules
+reduced mean startup from 311 ms to 197 ms after removing a duplicate filter
+index build. Allocated bytes per start fell from 405 MB to 283 MB; these are
+cumulative allocations, not retained memory or a whole-app benchmark.
+
 `main_test.go` builds the actual companion binary with `GO_BIN` (or `go` from
 `PATH`), starts it with pipes, and uses a synthetic loopback upstream.  It
 checks start/stop protocol statuses, invalid configuration errors, config-file
