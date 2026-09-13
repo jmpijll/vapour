@@ -18,7 +18,7 @@ This is a direction, not a release schedule. Windows usability and measurement c
 
 ## Curated protection
 
-Investigate reputable threat-intelligence and ad/tracker lists before enabling feed-based blocking. Source quality, redistribution terms, false positives, shared hosting, DNS/DoH/VPN behaviour, safe updates and rollback must be understood first. These features are not implemented yet.
+Investigate reputable threat-intelligence and ad/tracker lists before enabling feed-based blocking. Source quality, redistribution terms, false positives, shared hosting, DNS/DoH/VPN behaviour, safe updates and rollback must be understood first. Threat-feed download, atomic cache, a persistent switch and Windows firewall rule replacement are implemented. An isolated live TCP test verifies blocking, a control connection and cleanup; broader protocol coverage and sustained operation remain to be tested. The source-built DNS companion passes UDP/TCP filtering tests, but system DNS routing, crash recovery and the ad/tracker toggle remain in progress.
 
 ## Platforms
 

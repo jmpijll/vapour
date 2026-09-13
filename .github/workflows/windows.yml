@@ -36,5 +36,11 @@ jobs:
       - name: Speedtest engine checks
         working-directory: sidecar/librespeed
         run: go test ./...
+      - name: DNS companion tests
+        working-directory: src-dnsproxy
+        run: go test ./...
+      - name: DNS companion vet
+        working-directory: src-dnsproxy
+        run: go vet ./...
       - name: Standalone build
         run: pnpm build:native
