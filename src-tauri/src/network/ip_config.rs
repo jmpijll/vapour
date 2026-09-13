@@ -4,6 +4,9 @@ use parking_lot::Mutex;
 use std::sync::Arc;
 use windows::Win32::{NetworkManagement::IpHelper::*, Networking::WinSock::*};
 
+const REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+const STALE_AFTER: Duration = Duration::from_secs(60);
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpAddress { pub address: String, pub prefix_length: u8, pub family: String }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,60 +25,190 @@ pub struct IpConfiguration {
 #[derive(Default)]
 pub struct ConfigCache {
     sampled: Option<Instant>,
-    refreshing: bool,
+    ip_refresh_started: Option<Instant>,
+    ip_success_at: Option<Instant>,
+    routes_sampled: Option<Instant>,
+    routes_refresh_started: Option<Instant>,
+    routes_success_at: Option<Instant>,
     values: HashMap<u64, IpConfiguration>,
     pub failed: bool,
     routes: HashMap<u64, super::routes::RouteConfiguration>,
     pub routes_failed: bool,
 }
 impl ConfigCache {
-    fn begin_refresh(&mut self, now: Instant) -> bool {
-        if self.refreshing || self.sampled.is_some_and(|last| now.duration_since(last) < Duration::from_secs(30)) { return false; }
+    fn begin_ip_refresh(&mut self, now: Instant) -> bool {
+        if self.ip_refresh_started.is_some()
+            || self
+                .sampled
+                .is_some_and(|last| now.saturating_duration_since(last) < REFRESH_INTERVAL)
+        {
+            return false;
+        }
         self.sampled = Some(now);
-        self.refreshing = true;
+        self.ip_refresh_started = Some(now);
         true
     }
-    pub fn pending(&self) -> bool { self.refreshing && self.values.is_empty() && !self.failed }
+
+    fn begin_routes_refresh(&mut self, now: Instant) -> bool {
+        if self.routes_refresh_started.is_some()
+            || self
+                .routes_sampled
+                .is_some_and(|last| now.saturating_duration_since(last) < REFRESH_INTERVAL)
+        {
+            return false;
+        }
+        self.routes_sampled = Some(now);
+        self.routes_refresh_started = Some(now);
+        true
+    }
+
+    fn complete_ip(&mut self, result: Result<HashMap<u64, IpConfiguration>, u32>, sampled_at: Instant) {
+        self.ip_refresh_started = None;
+        match result {
+            Ok(values) => {
+                self.values = values;
+                self.failed = false;
+                self.ip_success_at = Some(sampled_at);
+            }
+            Err(_) => {
+                self.values.clear();
+                self.failed = true;
+                self.ip_success_at = None;
+            }
+        }
+    }
+
+    fn complete_routes(
+        &mut self,
+        result: Result<HashMap<u64, super::routes::RouteConfiguration>, u32>,
+        sampled_at: Instant,
+    ) {
+        self.routes_refresh_started = None;
+        match result {
+            Ok(values) => {
+                self.routes = values;
+                self.routes_failed = false;
+                self.routes_success_at = Some(sampled_at);
+            }
+            Err(_) => {
+                self.routes.clear();
+                self.routes_failed = true;
+                self.routes_success_at = None;
+            }
+        }
+    }
+
+    pub fn pending(&self) -> bool { self.ip_refresh_started.is_some() && self.ip_success_at.is_none() && !self.failed }
+
+    pub fn ip_configuration_status(&self, now: Instant) -> &'static str {
+        collector_status(
+            now,
+            self.ip_refresh_started,
+            self.ip_success_at,
+            self.failed,
+        )
+    }
+
+    pub fn route_configuration_status(&self, now: Instant) -> &'static str {
+        collector_status(
+            now,
+            self.routes_refresh_started,
+            self.routes_success_at,
+            self.routes_failed,
+        )
+    }
+
     pub fn routes(&self, luid: u64) -> Option<super::routes::RouteConfiguration> { self.routes.get(&luid).cloned() }
     pub fn get(&self, luid: u64) -> Option<IpConfiguration> { self.values.get(&luid).cloned() }
 }
-/// At most one bounded-result query worker per monitor. Windows calls do not
-/// hold the cache lock or delay the throughput sampler. Arc keeps state alive
-/// if a driver stalls; a stalled worker cannot cause more workers to spawn.
+
+fn collector_status(
+    now: Instant,
+    refreshing_since: Option<Instant>,
+    success_at: Option<Instant>,
+    failed: bool,
+) -> &'static str {
+    if let Some(sampled_at) = success_at {
+        if now.saturating_duration_since(sampled_at) >= STALE_AFTER {
+            return "stale";
+        }
+        return "available";
+    }
+    if let Some(started_at) = refreshing_since {
+        return if now.saturating_duration_since(started_at) >= STALE_AFTER {
+            "stale"
+        } else {
+            "pending"
+        };
+    }
+    if failed {
+        return "query_failed";
+    }
+    "not_available"
+}
+/// At most one bounded-result query worker runs per collector. Windows calls
+/// do not hold the cache lock or delay the throughput sampler. Arc keeps state
+/// alive if a driver stalls; a stalled worker cannot cause more workers to spawn.
 pub fn request_refresh(cache: &Arc<Mutex<ConfigCache>>, now: Instant) {
-    if !cache.lock().begin_refresh(now) { return; }
-    let target = Arc::clone(cache);
-    if std::thread::Builder::new().name("vapour-ip-config".into()).spawn(move || {
-        let routes = super::routes::collect();
-        let config = collect();
-        let mut state = target.lock();
-        match routes {
-            Ok(values) => { state.routes = values; state.routes_failed = false; }
-            Err(_) => { state.routes.clear(); state.routes_failed = true; }
-        }
-        match config {
-            Ok(values) => { state.values = values; state.failed = false; }
-            Err(_) => { state.values.clear(); state.failed = true; }
-        }
-        state.refreshing = false;
-    }).is_err() {
+    request_refresh_with(cache, now, super::routes::collect, collect);
+}
+
+fn request_refresh_with<R, I>(
+    cache: &Arc<Mutex<ConfigCache>>,
+    now: Instant,
+    route_collect: R,
+    ip_collect: I,
+) where
+    R: FnOnce() -> Result<HashMap<u64, super::routes::RouteConfiguration>, u32> + Send + 'static,
+    I: FnOnce() -> Result<HashMap<u64, IpConfiguration>, u32> + Send + 'static,
+{
+    let (refresh_routes, refresh_ip) = {
         let mut state = cache.lock();
-        state.refreshing = false;
-        state.values.clear(); state.routes.clear();
-        state.failed = true; state.routes_failed = true;
+        (state.begin_routes_refresh(now), state.begin_ip_refresh(now))
+    };
+
+    if refresh_routes {
+        let target = Arc::clone(cache);
+        if std::thread::Builder::new()
+            .name("vapour-route-config".into())
+            .spawn(move || {
+                let result = route_collect();
+                target.lock().complete_routes(result, Instant::now());
+            })
+            .is_err()
+        {
+            cache.lock().complete_routes(Err(8), Instant::now());
+        }
+    }
+
+    if refresh_ip {
+        let target = Arc::clone(cache);
+        if std::thread::Builder::new()
+            .name("vapour-ip-config".into())
+            .spawn(move || {
+                let result = ip_collect();
+                target.lock().complete_ip(result, Instant::now());
+            })
+            .is_err()
+        {
+            cache.lock().complete_ip(Err(8), Instant::now());
+        }
     }
 }
 
 // Windows returns pointers into this allocation. Validate each node before
 // copying it; neither linked-list cycles nor unexpected lengths grow the work.
 struct Buffer { storage: Vec<u64> }
+fn contains_range(start: usize, capacity: usize, ptr: usize, len: usize) -> bool {
+    let Some(end) = start.checked_add(capacity) else { return false; };
+    ptr >= start && ptr.checked_add(len).is_some_and(|last| last <= end)
+}
 impl Buffer {
     fn new(bytes: usize) -> Self { Self { storage: vec![0; bytes.div_ceil(8)] } }
     fn contains(&self, ptr: *const u8, len: usize) -> bool {
         let start = self.storage.as_ptr() as usize;
-        let end = start + self.storage.len() * 8;
-        let p = ptr as usize;
-        p >= start && p.checked_add(len).is_some_and(|last| last <= end)
+        let Some(capacity) = self.storage.len().checked_mul(8) else { return false; };
+        contains_range(start, capacity, ptr as usize, len)
     }
     fn read<T: Copy>(&self, ptr: *const T) -> Option<T> {
         self.contains(ptr.cast(), size_of::<T>()).then(|| unsafe { ptr.read_unaligned() })
@@ -198,7 +331,7 @@ mod tests {
     fn cache_retains_same_sample_within_interval() {
         let now = Instant::now();
         let mut cache = ConfigCache {sampled: Some(now), failed: true, ..Default::default()};
-        assert!(!cache.begin_refresh(now + Duration::from_secs(29)));
+        assert!(!cache.begin_ip_refresh(now + Duration::from_secs(29)));
         assert_eq!(cache.sampled, Some(now));
         assert!(cache.failed);
     }
@@ -206,10 +339,67 @@ mod tests {
     fn stalled_refresh_cannot_spawn_additional_workers() {
         let now = Instant::now();
         let mut state = ConfigCache::default();
-        assert!(state.begin_refresh(now));
-        assert!(!state.begin_refresh(now + Duration::from_secs(120)));
-        state.refreshing = false;
-        assert!(state.begin_refresh(now + Duration::from_secs(120)));
+        assert!(state.begin_ip_refresh(now));
+        assert!(!state.begin_ip_refresh(now + Duration::from_secs(120)));
+        state.ip_refresh_started = None;
+        assert!(state.begin_ip_refresh(now + Duration::from_secs(120)));
+    }
+    #[test]
+    fn each_collector_reports_stale_after_a_hung_first_query() {
+        let now = Instant::now();
+        let mut state = ConfigCache::default();
+
+        assert_eq!(state.ip_configuration_status(now), "not_available");
+        assert_eq!(state.route_configuration_status(now), "not_available");
+        assert!(state.begin_ip_refresh(now));
+        assert!(state.begin_routes_refresh(now));
+
+        assert_eq!(state.ip_configuration_status(now + Duration::from_secs(59)), "pending");
+        assert_eq!(state.route_configuration_status(now + Duration::from_secs(59)), "pending");
+        assert_eq!(state.ip_configuration_status(now + Duration::from_secs(60)), "stale");
+        assert_eq!(state.route_configuration_status(now + Duration::from_secs(60)), "stale");
+    }
+    #[test]
+    fn route_and_ip_refresh_state_can_complete_independently() {
+        let now = Instant::now();
+        let mut state = ConfigCache::default();
+        assert!(state.begin_ip_refresh(now));
+        assert!(state.begin_routes_refresh(now));
+
+        state.complete_routes(Ok(HashMap::new()), now + Duration::from_secs(1));
+
+        assert_eq!(state.route_configuration_status(now + Duration::from_secs(1)), "available");
+        assert_eq!(state.ip_configuration_status(now + Duration::from_secs(1)), "pending");
+        assert!(state.ip_refresh_started.is_some());
+        assert!(state.routes_refresh_started.is_none());
+    }
+    #[test]
+    fn collector_refresh_cannot_spawn_a_second_worker_after_stale_deadline() {
+        let now = Instant::now();
+        let mut state = ConfigCache::default();
+        assert!(state.begin_ip_refresh(now));
+        assert!(!state.begin_ip_refresh(now + Duration::from_secs(61)));
+        assert!(state.begin_routes_refresh(now));
+        assert!(!state.begin_routes_refresh(now + Duration::from_secs(61)));
+    }
+    #[test]
+    fn failed_retry_reports_pending_then_stale() {
+        let now = Instant::now();
+        let mut state = ConfigCache::default();
+        assert!(state.begin_ip_refresh(now));
+        state.complete_ip(Err(5), now + Duration::from_secs(1));
+        assert_eq!(state.ip_configuration_status(now + Duration::from_secs(1)), "query_failed");
+
+        let retry = now + Duration::from_secs(31);
+        assert!(state.begin_ip_refresh(retry));
+        assert_eq!(state.ip_configuration_status(retry), "pending");
+        assert_eq!(state.ip_configuration_status(retry + Duration::from_secs(60)), "stale");
+    }
+    #[test]
+    fn checked_bounds_reject_pointer_arithmetic_overflow() {
+        assert!(contains_range(100, 8, 104, 4));
+        assert!(!contains_range(usize::MAX - 3, 8, usize::MAX - 2, 1));
+        assert!(!contains_range(0, 8, usize::MAX, 1));
     }
     #[test]
     #[ignore = "Reads live local IP configuration; run explicitly"]

@@ -35,6 +35,7 @@ pub struct NetworkMonitor {
     icon_extractor: Arc<IconExtractor>,
     if_history: Mutex<HashMap<u64, InterfaceDelta>>,
     ip_configuration: Arc<Mutex<super::ip_config::ConfigCache>>,
+    wifi_cache: Arc<Mutex<super::wifi_cache::WifiCache>>,
     muted_streams: Mutex<HashSet<String>>,
     process_names_cache: Mutex<HashMap<u32, (String, String)>>,
     usage: super::usage::UsageCollector,
@@ -48,6 +49,7 @@ impl NetworkMonitor {
             icon_extractor: Arc::new(IconExtractor::new()),
             if_history: Mutex::new(HashMap::new()),
             ip_configuration: Arc::new(Mutex::new(Default::default())),
+            wifi_cache: Arc::new(Mutex::new(Default::default())),
             muted_streams: Mutex::new(HashSet::new()),
             process_names_cache: Mutex::new(HashMap::new()),
             usage: super::usage::UsageCollector::new(),
@@ -105,6 +107,9 @@ impl NetworkMonitor {
                 let rows_slice =
                     std::slice::from_raw_parts(&table.Table[0] as *const MIB_IF_ROW2, num_entries);
 
+                let connected_wifi = rows_slice.iter().filter(|r|r.Type == 71 && r.OperStatus.0 == 1).map(|r|format!("{:?}",r.InterfaceGuid)).collect();
+                super::wifi_cache::request(&self.wifi_cache, connected_wifi, now);
+                let wifi_cache = self.wifi_cache.lock();
                 let mut history = self.if_history.lock();
 
                 for row in rows_slice {
@@ -156,7 +161,8 @@ impl NetworkMonitor {
                     }
 
                     let config = ip_configuration.get(row.InterfaceLuid.Value);
-                    let config_status = if ip_configuration.pending() { "pending" } else if ip_configuration.failed { "query_failed" } else if config.is_some() { "available" } else { "not_available" };
+                    let status = ip_configuration.ip_configuration_status(now);
+                    let config_status = if status == "available" && config.is_none() { "not_available" } else { status };
                     interfaces.push(InterfaceInfo {
                         id: format!("if-{}", if_index),
                         name: desc,
@@ -175,10 +181,11 @@ impl NetworkMonitor {
                         transmit_link_speed_bps: reported_link_speed(row.TransmitLinkSpeed, is_connected && if_type != 24),
                         is_default_gateway: None, // Interface type does not establish a default route.
                         details: super::adapter::details(row),
+                        wifi: (if_type == 71).then(||wifi_cache.get(&format!("{:?}",row.InterfaceGuid),is_connected,now)),
                         ip_configuration: config,
                         ip_configuration_status: config_status.into(),
                         route_configuration: ip_configuration.routes(row.InterfaceLuid.Value),
-                        route_configuration_status: if ip_configuration.pending() { "pending" } else if ip_configuration.routes_failed { "query_failed" } else { "available" }.into(),
+                        route_configuration_status: ip_configuration.route_configuration_status(now).into(),
                     });
                 }
 

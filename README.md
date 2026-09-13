@@ -46,7 +46,7 @@ This is an early, source-first alpha. There is no signed installer or stable bin
 
 ### Requirements
 
-- Windows with WebView2 and the Visual Studio C++ build tools / Windows SDK.
+- Windows 10/11 x64 with WebView2 and the Visual Studio C++ build tools / Windows SDK.
 - Node.js 24 or newer and pnpm 11.
 - Rust 1.88 or newer, using the Windows MSVC toolchain.
 - Go 1.25 or newer; dependencies may select a newer Go toolchain automatically.

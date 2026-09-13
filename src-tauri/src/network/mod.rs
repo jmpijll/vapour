@@ -16,3 +16,6 @@ pub mod adapter;
 pub mod ip_config;
 
 pub mod routes;
+
+pub mod wifi_quality;
+pub mod wifi_cache;

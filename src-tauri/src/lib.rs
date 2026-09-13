@@ -8,6 +8,7 @@ use tauri::{
 
 pub mod firewall;
 pub mod network;
+pub mod protection;
 pub mod window;
 
 use firewall::FirewallManager;

@@ -17,6 +17,7 @@ export function InterfaceStatistics({ interfaces, back, advanced = false }: { in
           <p className="interface-description muted">{item.name}</p>
           <div className="interface-rates"><Rate value={item.download_speed_bps}/><Rate value={item.upload_speed_bps} up/></div>
           <div className="interface-link"><span className="muted" title="Adapter link rate reported by Windows; not internet throughput">Link speed</span><span aria-label={`Receive link speed ${linkSpeed(item.receive_link_speed_bps)}`}><ArrowDown size={13}/>{linkSpeed(item.receive_link_speed_bps)}</span><span aria-label={`Transmit link speed ${linkSpeed(item.transmit_link_speed_bps)}`}><ArrowUp size={13}/>{linkSpeed(item.transmit_link_speed_bps)}</span></div>
+          {item.wifi?.status === "available" && item.wifi.value?.status === "measured" && item.wifi.value.link_quality_percent != null && <div className="wifi-quality" title="Wi-Fi link quality"><Wifi size={14}/><meter min="0" max="100" value={item.wifi.value.link_quality_percent} aria-label="Wi-Fi link quality"/><span>{item.wifi.value.link_quality_percent}%</span></div>}
           {advanced && <AdapterDetailsView item={item}/>}
         </article>;
       })}
@@ -35,6 +36,7 @@ function AdapterDetailsView({item}: {item: InterfaceInfo}) {
       <dt>Index</dt><dd>{d.interface_index}</dd>
       <dt>GUID</dt><dd>{d.interface_guid}</dd>
     </dl> : <p className="detail-note">Unavailable</p>}</details>
+    {item.interface_type === "wifi" && <details><summary>Wi-Fi</summary><p className="detail-note">{item.wifi?.status || "Unavailable"}{item.wifi?.value && ` · ${item.wifi.value.status}`}</p>{item.wifi?.value && <><p className="detail-note">{item.wifi.value.phy_type || "Unknown PHY"}{item.wifi.value.is_mlo_connection ? " · MLO" : ""}</p>{item.wifi.value.links.map(link=><div className="adapter-route" key={link.link_id}>{link.center_frequency_khz/1000} MHz · {link.rssi_dbm} dBm</div>)}</>}</details>}
     <details><summary>IP configuration</summary><p className="detail-note">{item.ip_configuration_status || "Unavailable"}{ip && ` · ${new Date(ip.sampled_at).toLocaleTimeString()}`}</p>{ip && <dl>
       <dt>Addresses</dt><dd>{ip.addresses.map(a=><div key={`${a.address}/${a.prefix_length}`}>{a.address}/{a.prefix_length}</div>)}</dd>
       <dt>DNS</dt><dd>{ip.dns_servers.join(", ") || "—"}</dd>

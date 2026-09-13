@@ -49,3 +49,5 @@ src-tauri/vendor/windivert/*.sys
 
 /test-results/
 /playwright-report/
+
+/.tmp-*/

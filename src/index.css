@@ -863,3 +863,8 @@ button.speedtest-server:disabled { cursor:default; }
 .capture-diagnostics { font-size: 11px; margin: 16px 0; }
 .capture-diagnostics dl { display: grid; grid-template-columns: 1fr auto; gap: 6px; }
 .capture-diagnostics dd { margin: 0; }
+
+.wifi-quality { display: flex; align-items: center; gap: 8px; margin-top: 14px; color: var(--muted); font-size: 11px; }
+.wifi-quality meter { width: 70px; height: 7px; }
+.wifi-quality meter::-webkit-meter-bar { background: var(--border); border: none; }
+.wifi-quality meter::-webkit-meter-optimum-value { background: var(--muted); }
