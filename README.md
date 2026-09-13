@@ -47,9 +47,9 @@ This is an early, source-first alpha. There is no signed installer or stable bin
 ### Requirements
 
 - Windows with WebView2 and the Visual Studio C++ build tools / Windows SDK.
-- Node.js 24 or newer and pnpm 11.
-- Rust 1.88 or newer, using the Windows MSVC toolchain.
-- Go 1.25 or newer; dependencies may select a newer Go toolchain automatically.
+- Node.js 24 LTS and pnpm 11.27.0.
+- Rust through rustup; `rust-toolchain.toml` selects the tested Windows MSVC toolchain.
+- Go 1.27.1 (tested); the speedtest module requires at least Go 1.26.
 
 ### Build from source
 
