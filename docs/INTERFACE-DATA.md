@@ -37,10 +37,16 @@ Unit tests cover unknown states, flag decoding and exact u64 counters. An explic
 - [Microsoft MIB_IF_ROW2](https://learn.microsoft.com/en-us/windows/win32/api/netioapi/ns-netioapi-mib_if_row2)
 - [Microsoft Wi-Fi access and location changes](https://learn.microsoft.com/en-us/windows/win32/nativewifi/wi-fi-access-location-changes)
 
-IP and route queries run in a separate workers with one in-flight query per collector and refresh at most every 30 seconds when telemetry is sampled. The throughput sampler does not wait for the Windows calls. Topology changes may take up to one interval to appear. The initial buffer is 15 KB, allocation is capped at 8 MiB and retries at three; returned linked lists, declared structure lengths and socket lengths are bounded. IPv6 scope IDs are preserved. No DNS query is made to read configured DNS servers.
+IP and route queries run in separate workers with one in-flight query per collector and refresh at most every 30 seconds when telemetry is sampled. The throughput sampler does not wait for the Windows calls. Topology changes may take up to one interval to appear. The initial buffer is 15 KB, allocation is capped at 8 MiB and retries at three; returned linked lists, declared structure lengths and socket lengths are bounded. IPv6 scope IDs are preserved. No DNS query is made to read configured DNS servers.
 
 Wi-Fi research: realtime connection quality supports per-link/MLO data without SSID/BSSID, but current Microsoft documentation marks it prerelease without a clear minimum OS. Feature detection and payload-length validation are required; current windows 0.58 bindings do not expose it. Do not silently fall back to a location-sensitive query.
 
 The first query reports pending. Prior successful samples can remain visible during a refresh, with their original timestamps; a failed refresh clears that collector's data. A stalled Windows call cannot spawn further workers or block app shutdown. Each collector reports stale after 60 seconds, including a hung first query; IP and route queries complete independently. Old timestamped samples remain distinguishable until restart or a successful refresh. Empty route configuration with available status means no routes were returned for that interface. A default-route marker is table evidence, not a connectivity check or a claim that a destination uses that route. Infinite route lifetime and unused route metric use null; addresses and next hops remain local and are never logged by tests.
 
 Route reference: https://learn.microsoft.com/en-us/windows/win32/api/netioapi/ns-netioapi-mib_ipforward_row2
+
+## Wi-Fi collector status
+
+The realtime collector is wired to a separate worker, refreshing at most every five seconds. Samples become stale after 15 seconds; a disconnected adapter exposes no cached sample. It reads no SSID/BSSID and performs no scan or location-sensitive fallback. Link quality is a percentage; per-link center frequency is kHz and RSSI is dBm. Undocumented rate and bandwidth units remain raw and are not presented as throughput.
+
+The Windows live check found one disconnected WLAN interface, so no quality query was attempted. This verifies disconnected handling only; connected-driver support and live measurements remain unverified. The ignored live test logs aggregate counts, state and error codes without adapter identifiers.
