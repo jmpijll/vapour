@@ -34,6 +34,7 @@ pub struct NetworkMonitor {
     enricher: Arc<TrafficEnricher>,
     icon_extractor: Arc<IconExtractor>,
     if_history: Mutex<HashMap<u64, InterfaceDelta>>,
+    ip_configuration: Mutex<super::ip_config::ConfigCache>,
     muted_streams: Mutex<HashSet<String>>,
     process_names_cache: Mutex<HashMap<u32, (String, String)>>,
     usage: super::usage::UsageCollector,
@@ -46,6 +47,7 @@ impl NetworkMonitor {
             enricher: Arc::new(TrafficEnricher::new()),
             icon_extractor: Arc::new(IconExtractor::new()),
             if_history: Mutex::new(HashMap::new()),
+            ip_configuration: Mutex::new(Default::default()),
             muted_streams: Mutex::new(HashSet::new()),
             process_names_cache: Mutex::new(HashMap::new()),
             usage: super::usage::UsageCollector::new(),
@@ -92,6 +94,8 @@ impl NetworkMonitor {
         let mut interfaces = Vec::new();
         let mut total_down = 0u64;
         let mut total_up = 0u64;
+        let mut ip_configuration = self.ip_configuration.lock();
+        ip_configuration.refresh(now);
 
         unsafe {
             let mut table_ptr: *mut MIB_IF_TABLE2 = std::ptr::null_mut();
@@ -151,6 +155,8 @@ impl NetworkMonitor {
                         total_up += up_bps;
                     }
 
+                    let config = ip_configuration.get(row.InterfaceLuid.Value);
+                    let config_status = if ip_configuration.failed { "query_failed" } else if config.is_some() { "available" } else { "not_available" };
                     interfaces.push(InterfaceInfo {
                         id: format!("if-{}", if_index),
                         name: desc,
@@ -161,14 +167,16 @@ impl NetworkMonitor {
                         } else {
                             "disconnected".to_string()
                         },
-                        ipv4: None,
-                        ipv6: None,
+                        ipv4: config.as_ref().and_then(|c| c.addresses.iter().find(|a| a.family == "ipv4").map(|a| a.address.clone())),
+                        ipv6: config.as_ref().and_then(|c| c.addresses.iter().find(|a| a.family == "ipv6").map(|a| a.address.clone())),
                         download_speed_bps: down_bps,
                         upload_speed_bps: up_bps,
                         receive_link_speed_bps: reported_link_speed(row.ReceiveLinkSpeed, is_connected && if_type != 24),
                         transmit_link_speed_bps: reported_link_speed(row.TransmitLinkSpeed, is_connected && if_type != 24),
                         is_default_gateway: None, // Interface type does not establish a default route.
                         details: super::adapter::details(row),
+                        ip_configuration: config,
+                        ip_configuration_status: config_status.into(),
                     });
                 }
 

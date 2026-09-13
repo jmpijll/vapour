@@ -12,3 +12,5 @@ pub mod destinations;
 mod trace_cleanup;
 
 pub mod adapter;
+
+pub mod ip_config;

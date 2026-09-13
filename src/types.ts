@@ -22,6 +22,14 @@ export interface InterfaceInfo {
   transmit_link_speed_bps?: number | null;
   is_default_gateway: boolean | null;
   details?: AdapterDetails;
+  ip_configuration_status?: "available" | "not_available" | "query_failed";
+  ip_configuration?: {
+    source: "windows_get_adapters_addresses";
+    sampled_at: number;
+    addresses: { address: string; prefix_length: number; family: "ipv4" | "ipv6" }[];
+    dns_servers: string[]; gateways: string[];
+    ipv4_metric: number; ipv6_metric: number;
+  } | null;
 }
 
 export interface ProcessTraffic {

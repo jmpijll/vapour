@@ -14,13 +14,13 @@ The existing Windows interface sample includes an optional frontend `details` ob
 
 Counters are decimal strings, preserving unsigned 64-bit values in JavaScript. Driver resets/reinitialization can reset them; do not describe these as lifetime usage or Vapour-session totals. Zero error counters do not prove that a driver supports all diagnostics. Error/discard totals do not measure internet packet loss. Hardware=false does not identify a VPN vendor or prove a specific virtualization technology.
 
-The existing `is_default_gateway` is now nullable: interface type is not route evidence. IPv4/IPv6 fields are still unpopulated in native snapshots; do not invent addresses. The GUID and index are local identifiers, not stable device identity across reinstallation; redact them in shared diagnostics.
+The existing `is_default_gateway` is now nullable: interface type is not route evidence. Native IP configuration now contains all observed addresses/prefixes, DNS servers, configured gateways and per-family interface metrics. The legacy IPv4/IPv6 fields expose only the first address in each family. The GUID and index are local identifiers, not stable device identity across reinstallation; redact them in shared diagnostics.
 
 ## Next acquisition layers
 
 | Layer | Useful data | Acquisition and constraints |
 | --- | --- | --- |
-| IP configuration | All IPv4/IPv6 addresses and prefixes, DNS servers, DHCP state, gateway configuration | Cached GetAdaptersAddresses data. Keep lists, not one address per family. Refresh on change or a slower cadence. |
+| IP configuration | Implemented: all IPv4/IPv6 addresses and prefixes, DNS servers, gateway configuration, interface metrics. DHCP metadata remains future work. | GetAdaptersAddresses cache, 30-second interval, own timestamp. Joined by LUID; query failure clears stale data. Configured gateways do not prove an active default route. |
 | Routing | Default routes, route and interface metrics, family and interface association | Read route tables. Multiple defaults and VPN routes are valid; destination routing can differ. |
 | Wi-Fi quality | Link quality, PHY/radio information, per-link frequency/band where available | Prefer privacy-friendly realtime quality API; validate OS/driver support and result size before reading. No legacy fallback that prompts automatically. |
 | Wi-Fi identity | SSID/BSSID and connection security | Explicit on-demand opt-in if needed; location-sensitive Windows APIs can deny access. Never require these to show generic adapter statistics. |
@@ -36,3 +36,7 @@ Unit tests cover unknown states, flag decoding and exact u64 counters. An explic
 
 - [Microsoft MIB_IF_ROW2](https://learn.microsoft.com/en-us/windows/win32/api/netioapi/ns-netioapi-mib_if_row2)
 - [Microsoft Wi-Fi access and location changes](https://learn.microsoft.com/en-us/windows/win32/nativewifi/wi-fi-access-location-changes)
+
+The IP collector is synchronous on the existing telemetry worker (never the UI thread) and refreshes at most every 30 seconds. Topology changes may take up to one interval to appear. The initial buffer is 15 KB, allocation is capped at 8 MiB and retries at three; returned linked lists and socket lengths are bounded. IPv6 scope IDs are preserved. No DNS query is made to read configured DNS servers.
+
+Wi-Fi research: realtime connection quality supports per-link/MLO data without SSID/BSSID, but current Microsoft documentation marks it prerelease without a clear minimum OS. Feature detection and payload-length validation are required; current windows 0.58 bindings do not expose it. Do not silently fall back to a location-sensitive query.
