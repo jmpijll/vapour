@@ -25,6 +25,17 @@ pub struct AppState {
 }
 
 #[tauri::command]
+fn get_threat_feed_status(updater: State<'_, protection::updater::FeedUpdater>) -> protection::updater::UpdateStatus {
+    updater.status()
+}
+
+#[tauri::command]
+fn refresh_threat_feed(updater: State<'_, protection::updater::FeedUpdater>) -> protection::updater::UpdateStatus {
+    updater.request(true);
+    updater.status()
+}
+
+#[tauri::command]
 fn get_network_snapshot(state: State<'_, AppState>) -> Option<NetworkSnapshot> {
     state.latest.lock().clone()
 }
@@ -151,6 +162,9 @@ pub fn run() {
         .manage(capture::CaptureManager::default())
         .manage(state)
         .setup(move |app| {
+            app.manage(protection::updater::FeedUpdater::new(
+                app.path().app_data_dir()?.join("protection").join("feodo-v1.json"),
+            ));
             let handle = app.handle();
 
             // Load embedded icon
@@ -304,6 +318,8 @@ pub fn run() {
             set_appearance,
             list_blocks,
             get_firewall_environment,
+            get_threat_feed_status,
+            refresh_threat_feed,
             set_block,
             restart_as_administrator
         ])
