@@ -22,12 +22,19 @@ export interface InterfaceInfo {
   transmit_link_speed_bps?: number | null;
   is_default_gateway: boolean | null;
   details?: AdapterDetails;
-  ip_configuration_status?: "available" | "not_available" | "query_failed";
+  route_configuration_status?: "pending" | "available" | "query_failed";
+  route_configuration?: {
+    source: "windows_get_ip_forward_table2"; sampled_at: number;
+    routes: { destination: string; prefix_length: number; family: "ipv4" | "ipv6"; next_hop: string; route_metric: number | null; protocol_code: number; origin_code: number; is_default: boolean; valid_lifetime_seconds: number | null }[];
+  } | null;
+  ip_configuration_status?: "pending" | "available" | "not_available" | "query_failed";
   ip_configuration?: {
     source: "windows_get_adapters_addresses";
     sampled_at: number;
     addresses: { address: string; prefix_length: number; family: "ipv4" | "ipv6" }[];
     dns_servers: string[]; gateways: string[];
+    dhcpv4_enabled: boolean;
+    dhcpv4_server: string | null; dhcpv6_server: string | null;
     ipv4_metric: number; ipv6_metric: number;
   } | null;
 }

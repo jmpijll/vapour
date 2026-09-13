@@ -1,5 +1,7 @@
 use std::{collections::HashMap, mem::size_of, net::{Ipv4Addr, Ipv6Addr}, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
 use serde::{Deserialize, Serialize};
+use parking_lot::Mutex;
+use std::sync::Arc;
 use windows::Win32::{NetworkManagement::IpHelper::*, Networking::WinSock::*};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -11,21 +13,57 @@ pub struct IpConfiguration {
     pub addresses: Vec<IpAddress>,
     pub dns_servers: Vec<String>,
     pub gateways: Vec<String>,
+    pub dhcpv4_enabled: bool,
+    pub dhcpv4_server: Option<String>,
+    pub dhcpv6_server: Option<String>,
     pub ipv4_metric: u32,
     pub ipv6_metric: u32,
 }
 #[derive(Default)]
-pub struct ConfigCache { sampled: Option<Instant>, values: HashMap<u64, IpConfiguration>, pub failed: bool }
+pub struct ConfigCache {
+    sampled: Option<Instant>,
+    refreshing: bool,
+    values: HashMap<u64, IpConfiguration>,
+    pub failed: bool,
+    routes: HashMap<u64, super::routes::RouteConfiguration>,
+    pub routes_failed: bool,
+}
 impl ConfigCache {
-    pub fn refresh(&mut self, now: Instant) {
-        if self.sampled.is_some_and(|last| now.duration_since(last) < Duration::from_secs(30)) { return; }
+    fn begin_refresh(&mut self, now: Instant) -> bool {
+        if self.refreshing || self.sampled.is_some_and(|last| now.duration_since(last) < Duration::from_secs(30)) { return false; }
         self.sampled = Some(now);
-        match collect() {
-            Ok(values) => { self.values = values; self.failed = false; }
-            Err(_) => { self.values.clear(); self.failed = true; }
-        }
+        self.refreshing = true;
+        true
     }
+    pub fn pending(&self) -> bool { self.refreshing && self.values.is_empty() && !self.failed }
+    pub fn routes(&self, luid: u64) -> Option<super::routes::RouteConfiguration> { self.routes.get(&luid).cloned() }
     pub fn get(&self, luid: u64) -> Option<IpConfiguration> { self.values.get(&luid).cloned() }
+}
+/// At most one bounded-result query worker per monitor. Windows calls do not
+/// hold the cache lock or delay the throughput sampler. Arc keeps state alive
+/// if a driver stalls; a stalled worker cannot cause more workers to spawn.
+pub fn request_refresh(cache: &Arc<Mutex<ConfigCache>>, now: Instant) {
+    if !cache.lock().begin_refresh(now) { return; }
+    let target = Arc::clone(cache);
+    if std::thread::Builder::new().name("vapour-ip-config".into()).spawn(move || {
+        let routes = super::routes::collect();
+        let config = collect();
+        let mut state = target.lock();
+        match routes {
+            Ok(values) => { state.routes = values; state.routes_failed = false; }
+            Err(_) => { state.routes.clear(); state.routes_failed = true; }
+        }
+        match config {
+            Ok(values) => { state.values = values; state.failed = false; }
+            Err(_) => { state.values.clear(); state.failed = true; }
+        }
+        state.refreshing = false;
+    }).is_err() {
+        let mut state = cache.lock();
+        state.refreshing = false;
+        state.values.clear(); state.routes.clear();
+        state.failed = true; state.routes_failed = true;
+    }
 }
 
 // Windows returns pointers into this allocation. Validate each node before
@@ -41,6 +79,11 @@ impl Buffer {
     }
     fn read<T: Copy>(&self, ptr: *const T) -> Option<T> {
         self.contains(ptr.cast(), size_of::<T>()).then(|| unsafe { ptr.read_unaligned() })
+    }
+    fn node<T: Copy>(&self, ptr: *const T) -> Option<T> {
+        let declared = self.read(ptr.cast::<u32>())? as usize;
+        if declared < size_of::<T>() || !self.contains(ptr.cast(), declared) { return None; }
+        self.read(ptr)
     }
     fn address(&self, address: SOCKET_ADDRESS) -> Option<(String, bool)> {
         if address.iSockaddrLength < 2 || !self.contains(address.lpSockaddr.cast(), address.iSockaddrLength as usize) { return None; }
@@ -75,13 +118,17 @@ pub fn collect() -> Result<HashMap<u64, IpConfiguration>, u32> {
         let mut current = head;
         for _ in 0..4096 {
             if current.is_null() { return Ok(values); }
-            let row = buffer.read(current).ok_or(13u32)?;
+            let row = buffer.node(current).ok_or(13u32)?;
             let mut config = IpConfiguration { source: "windows_get_adapters_addresses".into(), sampled_at: timestamp,
-                addresses: vec![], dns_servers: vec![], gateways: vec![], ipv4_metric: row.Ipv4Metric, ipv6_metric: row.Ipv6Metric };
+                addresses: vec![], dns_servers: vec![], gateways: vec![],
+                dhcpv4_enabled: unsafe { row.Anonymous2.Flags & IP_ADAPTER_DHCP_ENABLED != 0 },
+                dhcpv4_server: buffer.address(row.Dhcpv4Server).map(|(ip, _)| ip),
+                dhcpv6_server: buffer.address(row.Dhcpv6Server).map(|(ip, _)| ip),
+                ipv4_metric: row.Ipv4Metric, ipv6_metric: row.Ipv6Metric };
             let mut node = row.FirstUnicastAddress;
             for _ in 0..4096 {
                 if node.is_null() { break; }
-                let a = buffer.read(node).ok_or(13u32)?;
+                let a = buffer.node(node).ok_or(13u32)?;
                 if let Some((address, v6)) = buffer.address(a.Address) {
                     if a.OnLinkPrefixLength <= if v6 {128} else {32} {
                         config.addresses.push(IpAddress {address, prefix_length: a.OnLinkPrefixLength, family: if v6 {"ipv6"} else {"ipv4"}.into()});
@@ -93,7 +140,7 @@ pub fn collect() -> Result<HashMap<u64, IpConfiguration>, u32> {
             let mut node = row.FirstDnsServerAddress;
             for _ in 0..4096 {
                 if node.is_null() { break; }
-                let a = buffer.read(node).ok_or(13u32)?;
+                let a = buffer.node(node).ok_or(13u32)?;
                 if let Some((address, _)) = buffer.address(a.Address) { config.dns_servers.push(address); }
                 node = a.Next;
             }
@@ -101,7 +148,7 @@ pub fn collect() -> Result<HashMap<u64, IpConfiguration>, u32> {
             let mut node = row.FirstGatewayAddress;
             for _ in 0..4096 {
                 if node.is_null() { break; }
-                let a = buffer.read(node).ok_or(13u32)?;
+                let a = buffer.node(node).ok_or(13u32)?;
                 if let Some((address, _)) = buffer.address(a.Address) { config.gateways.push(address); }
                 node = a.Next;
             }
@@ -142,12 +189,27 @@ mod tests {
         assert!(b.address(socket).is_none());
     }
     #[test]
+    fn rejects_short_declared_node_even_inside_large_allocation() {
+        let mut b = Buffer::new(size_of::<IP_ADAPTER_ADDRESSES_LH>());
+        unsafe { b.storage.as_mut_ptr().cast::<u32>().write_unaligned(8); }
+        assert!(b.node::<IP_ADAPTER_ADDRESSES_LH>(b.storage.as_ptr().cast()).is_none());
+    }
+    #[test]
     fn cache_retains_same_sample_within_interval() {
         let now = Instant::now();
         let mut cache = ConfigCache {sampled: Some(now), failed: true, ..Default::default()};
-        cache.refresh(now + Duration::from_secs(29));
+        assert!(!cache.begin_refresh(now + Duration::from_secs(29)));
         assert_eq!(cache.sampled, Some(now));
         assert!(cache.failed);
+    }
+    #[test]
+    fn stalled_refresh_cannot_spawn_additional_workers() {
+        let now = Instant::now();
+        let mut state = ConfigCache::default();
+        assert!(state.begin_refresh(now));
+        assert!(!state.begin_refresh(now + Duration::from_secs(120)));
+        state.refreshing = false;
+        assert!(state.begin_refresh(now + Duration::from_secs(120)));
     }
     #[test]
     #[ignore = "Reads live local IP configuration; run explicitly"]

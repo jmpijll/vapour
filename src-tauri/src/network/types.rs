@@ -28,6 +28,8 @@ pub struct InterfaceInfo {
     pub details: super::adapter::AdapterDetails,
     pub ip_configuration: Option<super::ip_config::IpConfiguration>,
     pub ip_configuration_status: String,
+    pub route_configuration: Option<super::routes::RouteConfiguration>,
+    pub route_configuration_status: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
