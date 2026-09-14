@@ -1,5 +1,6 @@
 //! Bounded, user-started interface capture. No global Pktmon session or filters.
 mod endpoint;
+mod bind_snapshot;
 mod native;
 mod packet;
 mod attribution;

@@ -35,10 +35,24 @@ endpoint. A selected server's Accept can authorize subsequent packets even when
 the peer's Connect preceded the SYN. Conflicting same-side ownership remains
 ambiguous. Regression tests also reject a stale selected Accept before a newer
 peer Connect, including the later handshake and payload packets. The full Rust
-library suite passes 197 tests, with 26 environment/native tests explicitly
-ignored; the release harness passes 61 offline tests.
+library suite passes 205 tests, with 26 environment/native tests explicitly
+ignored; the release harness passes 69 offline tests.
 
 For incoming UDP, the first request precedes the selected server's Accept event;
 the reply follows it and is captured. Later ownership evidence must not silently
 authorize an earlier datagram. Complete first-request support needs additional
 prior ownership evidence, and remains unverified.
+
+A new bounded UDP owner-module snapshot is verified against held IPv4/IPv6
+sockets in both native debug and release tests. It preserves bind timestamps,
+process creation times, scope IDs, wildcard overlap and unreadable competitors.
+Two snapshots must agree before a bind can identify the selected owner.
+Eight pure tests and the native socket test pass; the expanded release harness
+passes 69 offline tests plus the explicitly invoked native snapshot test.
+
+This snapshot is not yet used to authorize capture packets. Integration must
+record Bind/Close changes with their native timestamps and invalidate ownership
+after a matching change or metadata loss. A bind table describes the local
+socket, not its connected remote peer. First-datagram attribution must therefore
+combine prior bind evidence with verified matching flow ownership; a later
+Accept alone must not authorize an earlier packet or a reused socket lifetime.

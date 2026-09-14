@@ -58,7 +58,7 @@ impl Reader {fn shutdown(&self){self.handle.shutdown();}
 impl Drop for Reader {fn drop(&mut self){if self.worker.is_some(){let _=self.finish();}}}
 pub struct Collection {pub packets:Vec<(i64,Vec<u8>)>,pub events:Vec<Event>,pub qpc_frequency:u64,pub qpc_anchor:i64,pub filetime_anchor:i64}
 fn bounded_seconds(value:u64)->u64{value.clamp(1,60)}
-fn identity(pid:u32)->Option<Identity>{
+pub(super) fn identity(pid:u32)->Option<Identity>{
  use windows::Win32::{Foundation::{CloseHandle,FILETIME},System::Threading::*};
  unsafe{let h=OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,false,pid).ok()?;let(mut c,mut e,mut k,mut u)=(FILETIME::default(),FILETIME::default(),FILETIME::default(),FILETIME::default());let ok=GetProcessTimes(h,&mut c,&mut e,&mut k,&mut u).is_ok();let _=CloseHandle(h);ok.then_some(Identity{pid,creation_time_100ns:((c.dwHighDateTime as u64)<<32)|c.dwLowDateTime as u64})}
 }
