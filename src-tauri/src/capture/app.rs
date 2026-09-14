@@ -269,6 +269,7 @@ pub fn capture(
             return Err("Incomplete process evidence; recording discarded".into());
         }
     }
+    let udp_events: Vec<_> = capture.events.iter().filter(|event| event.flow.protocol == 17).copied().collect();
     let mut generations = Generations::new(capture.events, 4096);
     capture.packets.sort_by_key(|p| p.0);
     // Broad bytes never reach disk. Only admitted packets are encoded below.
@@ -339,6 +340,13 @@ pub fn capture(
             } else {
                 Verdict::Other
             }
+        };
+        let verdict = if info.protocol == 17 && matches!(verdict, Verdict::Unknown | Verdict::Other)
+            && capture.udp_binds.as_ref().is_some_and(|binds|
+                binds.incoming(&flow, at, &udp_events, &ledger, &identities) == Verdict::Selected) {
+            Verdict::Selected
+        } else {
+            verdict
         };
         diagnostics.packet(
             at,

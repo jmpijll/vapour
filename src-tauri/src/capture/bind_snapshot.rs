@@ -1,6 +1,5 @@
 //! Prior UDP bind evidence. This is not a remote-peer or TCP-generation oracle.
-#![allow(dead_code)] // Enabled in the capture path after native reconciliation tests.
-use super::attribution::{Identity, Verdict};
+use super::attribution::{Event, EventKind, Flow, Identity, Ledger, Verdict};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
 use windows::Win32::{
     Foundation::ERROR_INSUFFICIENT_BUFFER,
@@ -28,6 +27,70 @@ pub struct Snapshot {
 pub struct StableBinds {
     before: Snapshot,
     after: Snapshot,
+}
+
+pub struct PriorBinds {
+    stable: StableBinds,
+    ready_at: i64,
+    changes: Vec<(i64, Option<SocketAddr>)>,
+}
+
+impl PriorBinds {
+    pub fn new(before: Snapshot, after: Snapshot, ready_at: i64) -> Self {
+        Self {
+            stable: StableBinds::between(before, after),
+            ready_at,
+            changes: Vec::new(),
+        }
+    }
+    pub fn observe(&mut self, at: i64, local: Option<SocketAddr>) -> bool {
+        if at < 0 || self.changes.len() >= MAX_ROWS {
+            return false;
+        }
+        self.changes.push((at, local));
+        true
+    }
+    pub fn incoming(
+        &self,
+        flow: &Flow,
+        at: i64,
+        events: &[Event],
+        ledger: &Ledger,
+        selected: &[Identity],
+    ) -> Verdict {
+        if flow.protocol != 17 || self.ready_at < 0 || at < self.ready_at {
+            return Verdict::Unknown;
+        }
+        let prior = self.stable.classify(flow.remote, selected);
+        if prior != Verdict::Selected {
+            return prior;
+        }
+        for accepted in events.iter().filter(|event| {
+            event.kind == EventKind::Accept
+                && event.timestamp_qpc >= at
+                && selected.contains(&event.owner)
+                && event.flow.protocol == 17
+                && event.flow.local == flow.remote
+                && event.flow.remote == flow.local
+        }) {
+            if self.stable.classify(flow.remote, &[accepted.owner]) != Verdict::Selected {
+                continue;
+            }
+            // Prior local ownership and matching remote flow evidence are both
+            // required. A new Bind/Close between the snapshot and the Accept
+            // prevents an old socket from authorizing the next lifetime.
+            if self.changes.iter().any(|(changed_at, local)| {
+                *changed_at <= accepted.timestamp_qpc
+                    && local.is_none_or(|local| overlaps(local, flow.remote))
+            }) {
+                continue;
+            }
+            if ledger.classify(flow, accepted.timestamp_qpc, accepted.owner) == Verdict::Selected {
+                return Verdict::Selected;
+            }
+        }
+        Verdict::Unknown
+    }
 }
 
 impl StableBinds {
@@ -267,6 +330,97 @@ mod tests {
     }
     fn stable(rows: Vec<Bind>) -> StableBinds {
         StableBinds::between(Snapshot { rows: rows.clone() }, Snapshot { rows })
+    }
+    fn incoming_fixture() -> (PriorBinds, Flow, Vec<Event>, Ledger) {
+        let rows = vec![bind("127.0.0.1:8000", 1)];
+        let prior = PriorBinds::new(Snapshot { rows: rows.clone() }, Snapshot { rows }, 10);
+        let flow = Flow {
+            protocol: 17,
+            local: "127.0.0.1:9000".parse().unwrap(),
+            remote: "127.0.0.1:8000".parse().unwrap(),
+        };
+        let accepted = Event {
+            timestamp_qpc: 30,
+            endpoint_id: 5,
+            owner: owner(1),
+            flow: Flow {
+                protocol: 17,
+                local: flow.remote,
+                remote: flow.local,
+            },
+            kind: EventKind::Accept,
+        };
+        let mut ledger = Ledger::new(8);
+        assert!(ledger.ingest(accepted));
+        (prior, flow, vec![accepted], ledger)
+    }
+    #[test]
+    fn prior_bind_plus_matching_accept_authorizes_first_datagram() {
+        let (prior, flow, events, ledger) = incoming_fixture();
+        assert_eq!(
+            prior.incoming(&flow, 20, &events, &ledger, &[owner(1)]),
+            Verdict::Selected
+        );
+        assert_ne!(
+            prior.incoming(&flow, 9, &events, &ledger, &[owner(1)]),
+            Verdict::Selected
+        );
+    }
+    #[test]
+    fn bind_change_before_accept_blocks_prior_evidence_but_later_close_is_not_retroactive() {
+        for change_at in [19, 25, 30] {
+            let (mut prior, flow, events, ledger) = incoming_fixture();
+            assert!(prior.observe(change_at, Some(flow.remote)));
+            assert_ne!(
+                prior.incoming(&flow, 20, &events, &ledger, &[owner(1)]),
+                Verdict::Selected
+            );
+        }
+        let (mut prior, flow, events, ledger) = incoming_fixture();
+        assert!(prior.observe(31, Some(flow.remote)));
+        assert_eq!(
+            prior.incoming(&flow, 20, &events, &ledger, &[owner(1)]),
+            Verdict::Selected
+        );
+    }
+    #[test]
+    fn bind_alone_or_other_peer_cannot_authorize_a_datagram() {
+        let (prior, mut flow, events, ledger) = incoming_fixture();
+        assert_ne!(
+            prior.incoming(&flow, 20, &[], &ledger, &[owner(1)]),
+            Verdict::Selected
+        );
+        flow.local.set_port(9001);
+        assert_ne!(
+            prior.incoming(&flow, 20, &events, &ledger, &[owner(1)]),
+            Verdict::Selected
+        );
+    }
+    #[test]
+    fn another_selected_process_cannot_supply_the_missing_accept() {
+        let (prior, flow, mut events, _) = incoming_fixture();
+        events[0].owner = owner(2);
+        let mut ledger = Ledger::new(8);
+        assert!(ledger.ingest(events[0]));
+        assert_ne!(
+            prior.incoming(&flow, 20, &events, &ledger, &[owner(1), owner(2)]),
+            Verdict::Selected
+        );
+    }
+    #[test]
+    fn unknown_bind_change_invalidates_all_but_unrelated_socket_does_not() {
+        let (mut prior, flow, events, ledger) = incoming_fixture();
+        assert!(prior.observe(15, None));
+        assert_ne!(
+            prior.incoming(&flow, 20, &events, &ledger, &[owner(1)]),
+            Verdict::Selected
+        );
+        let (mut prior, flow, events, ledger) = incoming_fixture();
+        assert!(prior.observe(15, Some("0.0.0.0:8001".parse().unwrap())));
+        assert_eq!(
+            prior.incoming(&flow, 20, &events, &ledger, &[owner(1)]),
+            Verdict::Selected
+        );
     }
     #[test]
     fn exact_and_wildcard_prior_bind_authorize_only_the_matching_port() {
