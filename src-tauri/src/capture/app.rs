@@ -309,6 +309,10 @@ pub fn capture(
                 info.dport,
             ),
         };
+        let prior_tcp = if info.protocol == 6 {
+            capture.tcp_prior.as_mut().map(|prior| prior.classify(&flow, at, info.flags, &identities))
+                .unwrap_or(Verdict::Unknown)
+        } else { Verdict::Unknown };
         let verdict = if info.protocol == 6 {
             generations.classify_any(
                 TcpPacket {
@@ -341,7 +345,10 @@ pub fn capture(
                 Verdict::Other
             }
         };
-        let verdict = if info.protocol == 17 && matches!(verdict, Verdict::Unknown | Verdict::Other)
+        let verdict = if info.protocol == 6 && matches!(verdict, Verdict::Unknown | Verdict::Other)
+            && prior_tcp == Verdict::Selected {
+            Verdict::Selected
+        } else if info.protocol == 17 && matches!(verdict, Verdict::Unknown | Verdict::Other)
             && capture.udp_binds.as_ref().is_some_and(|binds|
                 binds.incoming(&flow, at, &udp_events, &ledger, &identities) == Verdict::Selected) {
             Verdict::Selected

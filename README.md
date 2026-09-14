@@ -74,7 +74,7 @@ This alpha favours excluding uncertain data over presenting guesses as facts.
 | Area | Current boundary |
 | --- | --- |
 | App measurements | Require administrator access. Very short-lived processes, event loss and sustained load need broader validation. |
-| Appcapture | Marked **Partial**. Focuses on evidenced new connections of processes present at capture start. Existing connections, all TCP patterns and complete inbound/server coverage are not supported. Counts are finalized on stop. |
+| Appcapture | Marked **Partial**. Native tests cover new incoming/outgoing TCP/UDP and stable existing TCP connections over IPv4/IPv6. Processes must be present at capture start. Rapid reuse, process churn and sustained-load coverage remain unverified. Counts are finalized on stop. |
 | Capture limits | Interface/session capture: 60 seconds / 64 MiB. Appcapture: 60 seconds with a 32 MiB collection budget and event limits. Driver queues are additional. Unknown app packets are excluded. |
 | Firewall | Outbound rules only. Rules remain until explicitly removed. Vapour does not enable disabled firewall profiles automatically. |
 | Destination names | Reverse DNS and other labels are hints, not verified service identity. |

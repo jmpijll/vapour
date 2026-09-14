@@ -56,7 +56,7 @@ impl Reader {fn shutdown(&self){self.handle.shutdown();}
   Ok(())
  }}
 impl Drop for Reader {fn drop(&mut self){if self.worker.is_some(){let _=self.finish();}}}
-pub struct Collection {pub packets:Vec<(i64,Vec<u8>)>,pub events:Vec<Event>,pub udp_binds:Option<super::bind_snapshot::PriorBinds>,pub qpc_frequency:u64,pub qpc_anchor:i64,pub filetime_anchor:i64}
+pub struct Collection {pub packets:Vec<(i64,Vec<u8>)>,pub events:Vec<Event>,pub udp_binds:Option<super::bind_snapshot::PriorBinds>,pub tcp_prior:Option<super::tcp_snapshot::PriorTcp>,pub qpc_frequency:u64,pub qpc_anchor:i64,pub filetime_anchor:i64}
 fn bounded_seconds(value:u64)->u64{value.clamp(1,60)}
 pub(super) fn identity(pid:u32)->Option<Identity>{
  use windows::Win32::{Foundation::{CloseHandle,FILETIME},System::Threading::*};
@@ -92,6 +92,7 @@ pub fn collect(dll:&Path,cancel:&AtomicBool,max_seconds:u64,ready:SyncSender<Res
  if BROKEN.load(Ordering::Acquire){return Err("Restart Vapour after the previous capture shutdown failure".into());}
  let api=Api::load(dll)?;let mut frequency=0;let mut anchor=0;let mut filetime=0u64;
  let before_binds=super::bind_snapshot::Snapshot::read().ok();
+ let before_tcp=super::tcp_snapshot::Snapshot::read().ok();
  unsafe{if QueryPerformanceFrequency(&mut frequency)==0||frequency<=0||QueryPerformanceCounter(&mut anchor)==0{return Err("Capture clock unavailable".into());}GetSystemTimeAsFileTime(&mut filetime);}
  let(tx,rx)=mpsc::sync_channel(4096);let failed=Arc::new(AtomicBool::new(false));let budget=Arc::new(AtomicUsize::new(0));let packet_count=Arc::new(AtomicUsize::new(0));
  let queue_full=Arc::new(AtomicUsize::new(0));let size_limit=Arc::new(AtomicUsize::new(0));
@@ -127,15 +128,26 @@ pub fn collect(dll:&Path,cancel:&AtomicBool,max_seconds:u64,ready:SyncSender<Res
   if unsafe{QueryPerformanceCounter(&mut ready_at)}==0{return None;}
   Some(super::bind_snapshot::PriorBinds::new(before,after,ready_at))
  });
+ let tcp_prior=before_tcp.and_then(|before| {
+  let after=super::tcp_snapshot::Snapshot::read().ok()?;
+  let mut ready_at=0;
+  if unsafe{QueryPerformanceCounter(&mut ready_at)}==0{return None;}
+  super::tcp_snapshot::PriorTcp::new(before,after,ready_at).ok()
+ });
  drop(tx);let _=ready.send(Ok(()));
- let mut result=Collection{packets:Vec::new(),events:Vec::new(),udp_binds,qpc_frequency:frequency as u64,qpc_anchor:anchor,filetime_anchor:filetime as i64};let mut cache=HashMap::new();let started=Instant::now();let mut metadata_count=0usize;
+ let mut result=Collection{packets:Vec::new(),events:Vec::new(),udp_binds,tcp_prior,qpc_frequency:frequency as u64,qpc_anchor:anchor,filetime_anchor:filetime as i64};let mut cache=HashMap::new();let started=Instant::now();let mut metadata_count=0usize;
  let mut receive=|message|->Result<(),String>{match message{Message::Packet(at,bytes)=>result.packets.push((at,bytes)),Message::Metadata(address)=>{
   metadata_count+=1;
   if metadata_count>20_000{return Err("Capture metadata limit reached".into());}
   if let Some((at,local))=bind_change(&api,&address){
    if result.udp_binds.as_mut().is_some_and(|binds|!binds.observe(at,local)){return Err("Invalid UDP bind history".into());}
   }
-  if let Some(e)=event(&api,address,&mut cache,anchor,filetime as i64,frequency as u64){result.events.push(e);}
+  if let Some(e)=event(&api,address,&mut cache,anchor,filetime as i64,frequency as u64){
+   if let Some(prior)=result.tcp_prior.as_mut(){prior.observe(&e);}
+   result.events.push(e);
+  }else if address.data[56]==6&&matches!((address.bits&255,(address.bits>>8)&255),(2,1|2)|(3,4|6|7)){
+   if let Some(prior)=result.tcp_prior.as_mut(){prior.invalidate_all(address.timestamp);}
+  }
  }}Ok(())};
  let mut processing_error=None;
  while !cancel.load(Ordering::Acquire)&&started.elapsed()<Duration::from_secs(bounded_seconds(max_seconds))&&!failed.load(Ordering::Acquire){

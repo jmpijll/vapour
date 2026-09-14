@@ -4,8 +4,10 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6};
 use windows::Win32::{
     Foundation::ERROR_INSUFFICIENT_BUFFER,
     NetworkManagement::IpHelper::{
-        GetExtendedUdpTable, MIB_UDP6ROW_OWNER_MODULE, MIB_UDP6TABLE_OWNER_MODULE,
-        MIB_UDPROW_OWNER_MODULE, MIB_UDPTABLE_OWNER_MODULE, UDP_TABLE_OWNER_MODULE,
+        GetExtendedTcpTable, GetExtendedUdpTable, MIB_TCP6ROW_OWNER_MODULE,
+        MIB_TCPROW_OWNER_MODULE, MIB_UDP6ROW_OWNER_MODULE, MIB_UDP6TABLE_OWNER_MODULE,
+        MIB_UDPROW_OWNER_MODULE, MIB_UDPTABLE_OWNER_MODULE, TCP_TABLE_OWNER_MODULE_ALL,
+        UDP_TABLE_OWNER_MODULE,
     },
     Networking::WinSock::{AF_INET, AF_INET6},
 };
@@ -180,7 +182,7 @@ fn overlaps(bind: SocketAddr, local: SocketAddr) -> bool {
 impl Snapshot {
     pub fn read() -> Result<Self, String> {
         let mut rows = Vec::new();
-        let ipv4 = read_table(AF_INET.0 as u32)?;
+        let ipv4 = read_owner_table(AF_INET.0 as u32, false)?;
         for row in decode::<MIB_UDPROW_OWNER_MODULE>(
             &ipv4,
             std::mem::offset_of!(MIB_UDPTABLE_OWNER_MODULE, table),
@@ -194,7 +196,7 @@ impl Snapshot {
                 row.liCreateTimestamp,
             )?);
         }
-        let ipv6 = read_table(AF_INET6.0 as u32)?;
+        let ipv6 = read_owner_table(AF_INET6.0 as u32, false)?;
         for row in decode::<MIB_UDP6ROW_OWNER_MODULE>(
             &ipv6,
             std::mem::offset_of!(MIB_UDP6TABLE_OWNER_MODULE, table),
@@ -233,58 +235,57 @@ fn make_bind(local: SocketAddr, pid: u32, created: i64) -> Result<Bind, String> 
     })
 }
 
-fn read_table(family: u32) -> Result<Vec<u8>, String> {
+pub(super) fn read_owner_table(family: u32, tcp: bool) -> Result<Vec<u8>, String> {
+    let query = |buffer: Option<*mut std::ffi::c_void>, size: &mut u32| unsafe {
+        if tcp {
+            GetExtendedTcpTable(buffer, size, false, family, TCP_TABLE_OWNER_MODULE_ALL, 0)
+        } else {
+            GetExtendedUdpTable(buffer, size, false, family, UDP_TABLE_OWNER_MODULE, 0)
+        }
+    };
     let mut needed = 0u32;
-    let code =
-        unsafe { GetExtendedUdpTable(None, &mut needed, false, family, UDP_TABLE_OWNER_MODULE, 0) };
+    let code = query(None, &mut needed);
     if code != 0 && code != ERROR_INSUFFICIENT_BUFFER.0 {
-        return Err(format!("Cannot size UDP bind snapshot ({code})"));
+        return Err(format!("Cannot size socket owner snapshot ({code})"));
     }
     for _ in 0..2 {
         let requested = needed as usize;
         if !(4..=MAX_BYTES).contains(&requested) {
-            return Err("Invalid UDP snapshot size".into());
+            return Err("Invalid socket snapshot size".into());
         }
         // The OWNER_MODULE rows contain 64-bit fields. Keep the native write
         // buffer aligned and use only the returned byte length afterward.
         let mut storage = vec![0u64; requested.div_ceil(8)];
-        let code = unsafe {
-            GetExtendedUdpTable(
-                Some(storage.as_mut_ptr().cast()),
-                &mut needed,
-                false,
-                family,
-                UDP_TABLE_OWNER_MODULE,
-                0,
-            )
-        };
+        let code = query(Some(storage.as_mut_ptr().cast()), &mut needed);
         if code == ERROR_INSUFFICIENT_BUFFER.0 {
             continue;
         }
         if code != 0 {
-            return Err(format!("Cannot read UDP bind snapshot ({code})"));
+            return Err(format!("Cannot read socket owner snapshot ({code})"));
         }
         if needed as usize > requested {
-            return Err("UDP snapshot returned an oversized buffer".into());
+            return Err("socket snapshot returned an oversized buffer".into());
         }
         return Ok(unsafe {
             std::slice::from_raw_parts(storage.as_ptr().cast::<u8>(), needed as usize)
         }
         .to_vec());
     }
-    Err("UDP bind snapshot changed during collection".into())
+    Err("socket owner snapshot changed during collection".into())
 }
 
 // SAFETY: Implementations must be pointer-free Copy types valid for every bit pattern.
-unsafe trait NativeRow: Copy {}
+pub(super) unsafe trait NativeRow: Copy {}
 unsafe impl NativeRow for MIB_UDPROW_OWNER_MODULE {}
 unsafe impl NativeRow for MIB_UDP6ROW_OWNER_MODULE {}
+unsafe impl NativeRow for MIB_TCPROW_OWNER_MODULE {}
+unsafe impl NativeRow for MIB_TCP6ROW_OWNER_MODULE {}
 
-fn decode<R: NativeRow>(bytes: &[u8], table_offset: usize) -> Result<Vec<R>, String> {
+pub(super) fn decode<R: NativeRow>(bytes: &[u8], table_offset: usize) -> Result<Vec<R>, String> {
     let count = u32::from_ne_bytes(
         bytes
             .get(..4)
-            .ok_or("Truncated UDP snapshot header")?
+            .ok_or("Truncated socket snapshot header")?
             .try_into()
             .unwrap(),
     ) as usize;
@@ -298,9 +299,9 @@ fn decode<R: NativeRow>(bytes: &[u8], table_offset: usize) -> Result<Vec<R>, Str
             .and_then(|n| table_offset.checked_add(n))
             .is_none_or(|end| end > bytes.len())
     {
-        return Err("Truncated or oversized UDP snapshot rows".into());
+        return Err("Truncated or oversized socket snapshot rows".into());
     }
-    // R is only used here with the SDK's integer-only UDP OWNER_MODULE rows.
+    // R is only used here with the SDK's integer-only TCP/UDP OWNER_MODULE rows.
     Ok((0..count)
         .map(|index| unsafe {
             bytes
