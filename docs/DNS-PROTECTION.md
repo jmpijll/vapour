@@ -8,6 +8,10 @@ the filtering companion.
 
 - The source-built companion listens on loopback and accepts an explicit numeric
   upstream. Rust verifies the embedded executable and supervises its lifetime.
+- An elevated caller launches the companion with the desktop user's primary
+  token through `CreateProcessWithTokenW`. The child is created suspended,
+  attached to a kill-on-close job, and verified non-elevated with medium-or-lower
+  integrity before it runs. Startup failure never falls back to an elevated child.
 - Dual-stack mode shares one filter engine across UDP/TCP listeners on
   127.0.0.1 and ::1. Rust rejects incomplete families, unexpected ports and an
   upstream pointing back to either listener before accepting readiness.
@@ -57,6 +61,14 @@ over IPv4 and IPv6 through one companion, then reloads its engine without
 changing listeners. Go integration tests verify cleanup after an IPv6 bind
 conflict while the IPv4 address was available.
 
+Native elevated tests now verify the real companion's start/stop lifecycle,
+dual-stack UDP/TCP filtering and reload, and preservation of the active rules
+after an invalid replacement. A separate native probe verifies redirected
+stdin/stdout and that additional inheritable sentinel handles do not increase
+the child's handle count. These checks made no system DNS changes. The linked
+UAC token on this host is identification-only; attempting to use or convert it
+as a primary token failed. The working launch path uses the desktop token.
+
 ## Resolver integration decision
 
 Direct numeric forwarding cannot be assumed to preserve Windows resolver
@@ -72,7 +84,7 @@ Calling it after pointing system DNS back at this
 proxy would risk recursion, so it is not a drop-in upstream replacement.
 
 These checks do not establish end-to-end protection. The remaining work includes
-the elevated launch path, protected journal creation and restore on this system,
+protected journal creation and restore on this system,
 watchdog launch and handshake integration, upstream selection, IPv4/IPv6 routing,
 proxy failure recovery, graceful shutdown, restart recovery, periodic updates,
 and the UI switch. DoH, VPN and per-application resolver behavior also need

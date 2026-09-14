@@ -812,37 +812,72 @@ fn make_non_inheritable(handle: &OwnedHandle) -> Result<(), String> {
 }
 
 #[cfg(windows)]
-fn caller_linked_primary_token() -> Result<OwnedHandle, String> {
+fn desktop_primary_token() -> Result<OwnedHandle, String> {
+    use windows::Win32::UI::WindowsAndMessaging::{GetShellWindow, GetWindowThreadProcessId};
     unsafe {
-        let mut caller_token = HANDLE::default();
-        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut caller_token)
-            .map_err(|error| format!("cannot open the current process token: {error}"))?;
-        let caller_token = OwnedHandle::from_raw_handle(caller_token.0);
-
-        let mut linked = TOKEN_LINKED_TOKEN::default();
-        let mut return_length = 0u32;
-        GetTokenInformation(
-            HANDLE(caller_token.as_raw_handle()),
-            TokenLinkedToken,
-            Some((&mut linked as *mut TOKEN_LINKED_TOKEN).cast()),
-            std::mem::size_of::<TOKEN_LINKED_TOKEN>() as u32,
-            &mut return_length,
-        )
-        .map_err(|error| {
-            format!("cannot obtain the current token's linked limited token: {error}")
-        })?;
-        if linked.LinkedToken.is_invalid() {
-            return Err(
-                "the current elevated token has no linked limited token; refusing DNS proxy launch"
-                    .to_owned(),
-            );
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(GetShellWindow(), Some(&mut pid));
+        if pid == 0 {
+            return Err("cannot find the desktop user's normal security token".to_owned());
         }
 
-        // GetTokenInformation returns an owned primary token handle in this
-        // record. Keep the linked token itself so CreateProcessAsUserW can
-        // recognize it as the restricted version of this caller's token and
-        // avoid requiring SeAssignPrimaryTokenPrivilege.
-        Ok(OwnedHandle::from_raw_handle(linked.LinkedToken.0))
+        let shell = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+            .map_err(|error| format!("cannot open the desktop shell process: {error}"))?;
+        let shell = OwnedHandle::from_raw_handle(shell.0);
+        let mut token = HANDLE::default();
+        OpenProcessToken(
+            HANDLE(shell.as_raw_handle()),
+            TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY,
+            &mut token,
+        )
+        .map_err(|error| format!("cannot open the desktop shell token: {error}"))?;
+        let token = OwnedHandle::from_raw_handle(token.0);
+
+        let mut elevation = TOKEN_ELEVATION::default();
+        let mut return_length = 0u32;
+        GetTokenInformation(
+            HANDLE(token.as_raw_handle()),
+            TokenElevation,
+            Some((&mut elevation as *mut TOKEN_ELEVATION).cast()),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut return_length,
+        )
+        .map_err(|error| format!("cannot inspect the desktop token elevation: {error}"))?;
+        if elevation.TokenIsElevated != 0 {
+            return Err("the desktop token is elevated; refusing DNS proxy launch".to_owned());
+        }
+
+        let mut primary = HANDLE::default();
+        DuplicateTokenEx(
+            HANDLE(token.as_raw_handle()),
+            TOKEN_ALL_ACCESS,
+            None,
+            SecurityImpersonation,
+            TokenPrimary,
+            &mut primary,
+        )
+        .map_err(|error| format!("cannot duplicate the desktop token: {error}"))?;
+        if primary.is_invalid() {
+            return Err("desktop token duplication returned an invalid handle".to_owned());
+        }
+        let primary = OwnedHandle::from_raw_handle(primary.0);
+
+        let mut token_type = TOKEN_TYPE::default();
+        GetTokenInformation(
+            HANDLE(primary.as_raw_handle()),
+            TokenType,
+            Some((&mut token_type as *mut TOKEN_TYPE).cast()),
+            std::mem::size_of::<TOKEN_TYPE>() as u32,
+            &mut return_length,
+        )
+        .map_err(|error| format!("cannot query duplicated desktop token type: {error}"))?;
+        if token_type != TokenPrimary {
+            return Err(format!(
+                "duplicated desktop token has unsupported type {}",
+                token_type.0
+            ));
+        }
+        Ok(primary)
     }
 }
 
@@ -931,6 +966,11 @@ fn verify_child_token_medium_or_lower(child: &ManagedChild) -> Result<(), String
 
 #[cfg(windows)]
 fn spawn_companion(path: &Path, elevated: bool) -> Result<SpawnedChild, String> {
+    let token = if elevated {
+        Some(desktop_primary_token()?)
+    } else {
+        None
+    };
     let (child_stdin_read, parent_stdin_write) = anonymous_pipe()?;
     let (parent_stdout_read, child_stdout_write) = anonymous_pipe()?;
     make_non_inheritable(&parent_stdin_write)?;
@@ -1010,22 +1050,22 @@ fn spawn_companion(path: &Path, elevated: bool) -> Result<SpawnedChild, String> 
     let mut process_info = PROCESS_INFORMATION::default();
     let creation_flags =
         PROCESS_CREATION_FLAGS(CREATE_NO_WINDOW) | CREATE_SUSPENDED | EXTENDED_STARTUPINFO_PRESENT;
-    let result = if elevated {
-        let token = caller_linked_primary_token()?;
+    let result = if let Some(token) = token.as_ref() {
+        // CreateProcessWithTokenW uses plain STARTUPINFO. On supported x64
+        // Windows it duplicates the supplied standard handles without general
+        // inheritable-handle propagation (covered by the native sentinel test).
+        let mut plain_startup = startup.StartupInfo;
+        plain_startup.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
         unsafe {
-            // CreateProcessAsUserW accepts STARTUPINFOEX and the restricted
-            // handle list while applying the desktop user's primary token.
-            CreateProcessAsUserW(
+            CreateProcessWithTokenW(
                 HANDLE(token.as_raw_handle()),
+                CREATE_PROCESS_LOGON_FLAGS(0),
                 PCWSTR(application.as_ptr()),
                 PWSTR(command_line.as_mut_ptr()),
-                None,
-                None,
-                true,
-                creation_flags,
+                PROCESS_CREATION_FLAGS(CREATE_NO_WINDOW) | CREATE_SUSPENDED,
                 None,
                 PCWSTR(directory.as_ptr()),
-                &startup.StartupInfo as *const STARTUPINFOW,
+                &plain_startup,
                 &mut process_info,
             )
         }
@@ -1816,6 +1856,16 @@ mod tests {
         token: &OwnedHandle,
         _sentinels: &[OwnedHandle],
     ) -> Result<(SpawnedChild, u32), String> {
+        plain_token_probe_child_with_command(executable, token, _sentinels, "exit 0")
+    }
+
+    #[cfg(windows)]
+    fn plain_token_probe_child_with_command(
+        executable: &Path,
+        token: &OwnedHandle,
+        _sentinels: &[OwnedHandle],
+        command: &str,
+    ) -> Result<(SpawnedChild, u32), String> {
         let (child_stdin_read, parent_stdin_write) = anonymous_pipe()?;
         let (parent_stdout_read, child_stdout_write) = anonymous_pipe()?;
         make_non_inheritable(&parent_stdin_write)?;
@@ -1826,7 +1876,7 @@ mod tests {
             .encode_utf16()
             .chain(Some(0))
             .collect::<Vec<_>>();
-        let mut command_line = format!("\"{}\" /c exit 0", executable.display())
+        let mut command_line = format!("\"{}\" /c {command}", executable.display())
             .encode_utf16()
             .chain(Some(0))
             .collect::<Vec<_>>();
@@ -1868,8 +1918,13 @@ mod tests {
         let thread = unsafe { OwnedHandle::from_raw_handle(process_info.hThread.0) };
         let mut handle_count = 0u32;
         unsafe {
-            GetProcessHandleCount(HANDLE(process.as_raw_handle()), &mut handle_count)
-                .map_err(|error| format!("cannot count probe child handles: {error}"))?;
+            if let Err(error) =
+                GetProcessHandleCount(HANDLE(process.as_raw_handle()), &mut handle_count)
+            {
+                let _ = TerminateProcess(HANDLE(process.as_raw_handle()), 1);
+                WaitForSingleObject(HANDLE(process.as_raw_handle()), 5_000);
+                return Err(format!("cannot count probe child handles: {error}"));
+            }
         }
         Ok((
             SpawnedChild {
@@ -1886,6 +1941,65 @@ mod tests {
             },
             handle_count,
         ))
+    }
+
+    #[cfg(windows)]
+    fn plain_token_probe_stdio(token: &OwnedHandle) -> Result<Vec<u8>, String> {
+        let executable = std::env::var_os("ComSpec")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Windows\System32\cmd.exe"));
+        // `more` copies the redirected stdin to stdout and exits on EOF. This
+        // exercises both STARTF_USESTDHANDLES entries without an EX startup
+        // structure or an ambient handle list.
+        let (mut spawned, _) =
+            plain_token_probe_child_with_command(&executable, token, &[], "more")?;
+        if let Err(error) = verify_child_token_medium_or_lower(&spawned.child) {
+            terminate_child(&mut spawned.child, None);
+            return Err(error);
+        }
+
+        if unsafe { ResumeThread(HANDLE(spawned.thread.as_raw_handle())) } == u32::MAX {
+            terminate_child(&mut spawned.child, None);
+            let _ = unsafe {
+                WaitForSingleObject(HANDLE(spawned.child.process.as_raw_handle()), 5_000)
+            };
+            return Err("cannot resume plain token stdio probe".to_owned());
+        }
+        drop(spawned.thread);
+
+        let mut stdin = spawned
+            .child
+            .stdin
+            .take()
+            .ok_or_else(|| "plain token probe stdin pipe was not created".to_owned())?;
+        if let Err(error) = stdin.write_all(b"dns-token-stdio-probe\r\n") {
+            terminate_child(&mut spawned.child, None);
+            let _ = unsafe {
+                WaitForSingleObject(HANDLE(spawned.child.process.as_raw_handle()), 5_000)
+            };
+            return Err(format!("cannot write plain token probe stdin: {error}"));
+        }
+        drop(stdin);
+
+        let wait =
+            unsafe { WaitForSingleObject(HANDLE(spawned.child.process.as_raw_handle()), 5_000) };
+        if wait != windows::Win32::Foundation::WAIT_OBJECT_0 {
+            terminate_child(&mut spawned.child, None);
+            let _ = unsafe {
+                WaitForSingleObject(HANDLE(spawned.child.process.as_raw_handle()), 5_000)
+            };
+            return Err(format!("plain token stdio probe did not exit: {wait:?}"));
+        }
+
+        let mut output = Vec::new();
+        spawned
+            .child
+            .stdout
+            .take()
+            .ok_or_else(|| "plain token probe stdout pipe was not created".to_owned())?
+            .read_to_end(&mut output)
+            .map_err(|error| format!("cannot read plain token probe stdout: {error}"))?;
+        Ok(output)
     }
 
     #[cfg(windows)]
@@ -1908,6 +2022,7 @@ mod tests {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(r"C:\Windows\System32\cmd.exe"));
         let (mut spawned, count) = plain_token_probe_child(&executable, token, &sentinels)?;
+        verify_child_token_medium_or_lower(&spawned.child)?;
         terminate_child(&mut spawned.child, None);
         unsafe {
             let _ = WaitForSingleObject(HANDLE(spawned.child.process.as_raw_handle()), 5_000);
@@ -1971,12 +2086,8 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    #[ignore = "requires an unelevated Windows desktop token and the real companion"]
+    #[ignore = "requires a Windows desktop token and the real companion; supports elevated and normal callers"]
     fn reload_changes_live_udp_rules_and_preserves_rejected_update() {
-        assert!(
-            !crate::firewall::FirewallManager::is_elevated(),
-            "run this lifecycle test from an unelevated app token"
-        );
         let upstream = SyntheticUpstream::start();
         let path = test_directory("reload");
         let manager = DnsProcessManager::new(path.clone());
@@ -2152,14 +2263,16 @@ mod tests {
         let _ = fs::remove_dir_all(path);
     }
 
+    #[cfg(windows)]
     #[test]
-    #[ignore = "requires an elevated interactive app; probes plain CreateProcessWithTokenW handle inheritance"]
-    fn elevated_plain_token_probe_does_not_inherit_ambient_handles() {
+    #[ignore = "requires an elevated interactive app; probes desktop-primary CreateProcessWithTokenW stdio and handle inheritance"]
+    fn elevated_desktop_primary_plain_token_probe_stdio_and_handles() {
         assert!(
             crate::firewall::FirewallManager::is_elevated(),
-            "run this handle-inheritance probe from an elevated app token"
+            "run this desktop-token probe from an elevated app token"
         );
-        let token = caller_linked_primary_token().expect("obtain the linked limited token");
+        let token = desktop_primary_token().expect("obtain the desktop primary token");
+
         let baseline = plain_token_probe_handle_count(&token, false)
             .expect("plain token probe without sentinel handles");
         let with_sentinels = plain_token_probe_handle_count(&token, true)
@@ -2167,6 +2280,13 @@ mod tests {
         assert_eq!(
             with_sentinels, baseline,
             "plain CreateProcessWithTokenW inherited an ambient sentinel handle"
+        );
+
+        let output = plain_token_probe_stdio(&token).expect("plain token probe stdio");
+        let output = String::from_utf8_lossy(&output);
+        assert!(
+            output.contains("dns-token-stdio-probe"),
+            "plain CreateProcessWithTokenW did not round-trip redirected stdio: {output:?}"
         );
     }
 }
