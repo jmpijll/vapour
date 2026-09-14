@@ -63,8 +63,12 @@ Direct numeric forwarding cannot be assumed to preserve Windows resolver
 policy. Selecting every adapter's servers is also not equivalent to Windows
 fallback and VPN policy. The native
 [DnsQueryRaw API](https://learn.microsoft.com/en-us/windows/win32/api/windns/nf-windns-dnsqueryraw)
-can apply host NRPT and encrypted DNS settings; its availability and integration
-are being tested separately. Calling it after pointing system DNS back at this
+can apply host NRPT and encrypted DNS settings. An isolated native probe on
+Windows build 26200 resolved a real raw DNS query successfully and exercised
+cancellation of a pending query. Runtime API discovery succeeded; adapter DNS
+settings were unchanged. This establishes API availability on the test host,
+not VPN-policy coverage or compatibility with older Windows versions.
+Calling it after pointing system DNS back at this
 proxy would risk recursion, so it is not a drop-in upstream replacement.
 
 These checks do not establish end-to-end protection. The remaining work includes
