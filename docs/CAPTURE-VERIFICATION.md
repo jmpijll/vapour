@@ -1,6 +1,6 @@
 # Windows appcapture verification
 
-Appcapture remains **Partial**. The latest isolated native debug run checks
+Appcapture remains **Partial**. Isolated native debug and release runs check
 selected and control processes using local traffic. A positive result requires
 application payload in both directions and no exported control traffic;
 capturing a TCP SYN alone is insufficient.
@@ -17,18 +17,18 @@ The pre-existing TCP cases pass their exclusion assertions, but this is not
 support for capturing existing connections. They must not inflate the supported
 scenario count. Six of the eight positive capture cases currently pass.
 
-An independent Python parser checked the six passing PCAPNG files: block
+An independent Python parser checked the six passing PCAPNG files from each build: block
 lengths and footers, raw-IP interface records, captured/original lengths, IP and
 transport lengths, selected payload and reply markers, and absence of the
 control marker. TCP exports contain 40 application bytes and UDP exports contain
 42 application bytes per address family. Private traces and captures are kept
 outside the public repository.
 
-This evidence covers controlled loopback fixtures in a debug native harness
+This evidence covers controlled loopback fixtures in a debug and release native harness
 that imports the production capture modules. It does not establish complete
-UDP server-side attribution, existing-connection support, release-build runtime
-coverage, process churn, retransmission coverage or sustained-load accuracy.
-Scoped diagnostics are excluded from release builds.
+UDP server-side attribution, existing-connection support, process churn,
+retransmission coverage or sustained-load accuracy. Scoped diagnostics are
+excluded from release builds; the release run produced no diagnostic traces.
 
 The fixed TCP generation tracks verified opening evidence separately for each
 endpoint. A selected server's Accept can authorize subsequent packets even when
