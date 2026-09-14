@@ -16,12 +16,52 @@ struct Side {
     boundaries: Vec<u32>,
     fins: Vec<u32>,
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Opening {
+    endpoint_id: u64,
+    owner: Identity,
+}
+#[derive(Clone)]
+struct OwnerEvidence {
+    sides: [Vec<Opening>; 2],
+    ambiguous: bool,
+}
+impl OwnerEvidence {
+    fn new() -> Self {
+        Self {
+            sides: [Vec::new(), Vec::new()],
+            ambiguous: false,
+        }
+    }
+    fn add(&mut self, side: usize, opening: Opening) {
+        if self.sides[side].contains(&opening) {
+            return;
+        }
+        if !self.sides[side].is_empty() {
+            // Multiple unclosed openings on one oriented side can be tuple
+            // reuse or an identity conflict. Opposite-side ownership is
+            // legitimate for an inbound connection.
+            self.ambiguous = true;
+        }
+        self.sides[side].push(opening);
+    }
+    fn owners(&self) -> Vec<Identity> {
+        let mut owners = Vec::new();
+        for opening in self.sides.iter().flatten() {
+            if !owners.contains(&opening.owner) {
+                owners.push(opening.owner);
+            }
+        }
+        owners
+    }
+}
 #[derive(Clone)]
 struct Generation {
     flow: Flow,
     start: i64,
     syn: u32,
     owners: Vec<Identity>,
+    evidence: OwnerEvidence,
     sides: [Option<Side>; 2],
     poisoned: bool,
 }
@@ -42,9 +82,8 @@ impl Generations {
             invalid: capacity == 0,
         }
     }
-    fn owners(&self, flow: Flow, at: i64) -> Vec<Identity> {
-        let mut result = Vec::new();
-        let mut endpoints = Vec::new();
+    fn owner_evidence(&self, flow: Flow, at: i64) -> OwnerEvidence {
+        let mut evidence = OwnerEvidence::new();
         for e in &self.events {
             // A late ACCEPT cannot retroactively authorize an earlier SYN.
             if !e.flow.matches(&flow)
@@ -65,12 +104,63 @@ impl Generations {
             }) {
                 continue;
             }
-            if !endpoints.contains(&(e.endpoint_id, e.owner)) {
-                endpoints.push((e.endpoint_id, e.owner));
-                result.push(e.owner);
+            let side = if e.flow == flow {
+                0
+            } else if e.flow.protocol == flow.protocol
+                && e.flow.local == flow.remote
+                && e.flow.remote == flow.local
+            {
+                1
+            } else {
+                continue;
+            };
+            // An ACCEPT from an older lifetime must not authorize a new
+            // client opening. When a current-side CONNECT is present, only
+            // an ACCEPT at or after that opening can belong to this tuple.
+            if side == 1
+                && matches!(e.kind, EventKind::Accept)
+                && self
+                    .events
+                    .iter()
+                    .filter(|c| {
+                        c.flow == flow
+                            && c.timestamp_qpc <= at
+                            && matches!(c.kind, EventKind::Connect)
+                    })
+                    .map(|c| c.timestamp_qpc)
+                    .max()
+                    .is_some_and(|connect_at| e.timestamp_qpc < connect_at)
+            {
+                continue;
+            }
+            evidence.add(
+                side,
+                Opening {
+                    endpoint_id: e.endpoint_id,
+                    owner: e.owner,
+                },
+            );
+        }
+        evidence
+    }
+    fn merge_evidence(generation: &mut Generation, incoming: OwnerEvidence) -> bool {
+        if incoming.ambiguous {
+            return false;
+        }
+        for side in 0..2 {
+            // A later opening on the same side belongs to a possible tuple
+            // reuse. TCP sequence evidence already selected this generation,
+            // so retain its owner and do not merge the unrelated opening.
+            for opening in incoming.sides[side].iter().copied() {
+                if generation.evidence.sides[side].is_empty() {
+                    generation.evidence.sides[side].push(opening);
+                } else if generation.evidence.sides[side].contains(&opening) {
+                    continue;
+                }
             }
         }
-        result
+        generation.owners = generation.evidence.owners();
+        true
     }
     pub fn classify(&mut self, packet: Packet, selected: Identity) -> Verdict {
         self.classify_any(packet, &[selected])
@@ -87,11 +177,12 @@ impl Generations {
         }
         let plain_syn = packet.flags == 2 && packet.payload == 0;
         if plain_syn {
-            let owners = self.owners(packet.flow, packet.at);
-            if owners.len() > 1 {
+            let evidence = self.owner_evidence(packet.flow, packet.at);
+            if evidence.ambiguous {
                 self.poison(packet.flow);
                 return Verdict::Unknown;
             }
+            let owners = evidence.owners();
             if self
                 .generations
                 .iter()
@@ -142,6 +233,7 @@ impl Generations {
                 start: packet.at,
                 syn: packet.seq,
                 owners: owners.clone(),
+                evidence,
                 poisoned: false,
                 sides: [
                     Some(Side {
@@ -232,12 +324,9 @@ impl Generations {
                     }
                 }
             }
-            if g.owners.is_empty() {
-                let owners = self.owners(packet.flow, packet.at);
-                if owners.len() > 1 {
-                    continue;
-                }
-                g.owners.extend(owners);
+            let generation_flow = g.flow;
+            if !Self::merge_evidence(&mut g, self.owner_evidence(generation_flow, packet.at)) {
+                continue;
             }
             candidates.push((index, g));
         }
@@ -371,6 +460,83 @@ mod tests {
         assert_eq!(
             g.classify(p(13, 11, 51, 16, false), id(200)),
             Verdict::Selected
+        );
+    }
+    #[test]
+    fn inbound_trace_accept_replaces_peer_connect_owner_after_syn() {
+        let selected = id(200);
+        let peer = id(100);
+        let mut connect = event(10, peer.pid, EventKind::Connect);
+        connect.endpoint_id = 10;
+        let mut accept = event(20, selected.pid, EventKind::Accept);
+        accept.endpoint_id = 20;
+        std::mem::swap(&mut accept.flow.local, &mut accept.flow.remote);
+        let mut g = Generations::new(vec![connect, accept], 8);
+
+        // The inbound SYN can precede the selected process's ACCEPT event;
+        // preserve the packet verdict already observed in the native trace.
+        assert_eq!(g.classify(p(11, 10, 0, 2, false), selected), Verdict::Other);
+        // Once the verified opposite endpoint is observed, the same TCP
+        // generation must carry the selected owner for the remaining stream.
+        assert_eq!(
+            g.classify(p(21, 50, 11, 18, true), selected),
+            Verdict::Selected
+        );
+        assert_eq!(
+            g.classify(p(22, 11, 51, 16, false), selected),
+            Verdict::Selected
+        );
+        assert_eq!(
+            g.classify(
+                Packet {
+                    flow: flow(),
+                    at: 23,
+                    seq: 11,
+                    ack: 51,
+                    flags: 24,
+                    payload: 21,
+                },
+                selected,
+            ),
+            Verdict::Selected
+        );
+    }
+    #[test]
+    fn stale_opposite_accept_does_not_authorize_new_syn() {
+        let selected = id(200);
+        let peer = id(100);
+        let mut stale_accept = event(10, selected.pid, EventKind::Accept);
+        stale_accept.endpoint_id = 10;
+        std::mem::swap(&mut stale_accept.flow.local, &mut stale_accept.flow.remote);
+        let mut current_connect = event(20, peer.pid, EventKind::Connect);
+        current_connect.endpoint_id = 20;
+        let mut g = Generations::new(vec![stale_accept, current_connect], 8);
+
+        // The selected ACCEPT belongs to an older lifetime than this newer
+        // client opening. Without a fresh selected-server ACCEPT, it cannot
+        // authorize the new SYN.
+        assert_eq!(g.classify(p(21, 99, 0, 2, false), selected), Verdict::Other);
+        assert_eq!(
+            g.classify(p(22, 50, 100, 18, true), selected),
+            Verdict::Other
+        );
+        assert_eq!(
+            g.classify(p(23, 100, 51, 16, false), selected),
+            Verdict::Other
+        );
+        assert_eq!(
+            g.classify(
+                Packet {
+                    flow: flow(),
+                    at: 24,
+                    seq: 100,
+                    ack: 51,
+                    flags: 24,
+                    payload: 21
+                },
+                selected,
+            ),
+            Verdict::Other
         );
     }
     #[test]
@@ -524,9 +690,18 @@ mod tests {
             remote: "127.0.0.1:41000".parse().unwrap(),
         };
         let mut g = Generations::new(vec![selected, peer], 8);
-        assert_eq!(g.classify(p(11, 10, 0, 2, false), id(100)), Verdict::Selected);
-        assert_eq!(g.classify(p(13, 50, 11, 18, true), id(100)), Verdict::Selected);
-        assert_eq!(g.classify(p(14, 11, 51, 16, false), id(100)), Verdict::Selected);
+        assert_eq!(
+            g.classify(p(11, 10, 0, 2, false), id(100)),
+            Verdict::Selected
+        );
+        assert_eq!(
+            g.classify(p(13, 50, 11, 18, true), id(100)),
+            Verdict::Selected
+        );
+        assert_eq!(
+            g.classify(p(14, 11, 51, 16, false), id(100)),
+            Verdict::Selected
+        );
     }
     #[test]
     fn app_group_matches_any_verified_identity_once_per_packet() {

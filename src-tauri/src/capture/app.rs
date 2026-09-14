@@ -75,7 +75,7 @@ impl Diagnostics {
             let _ = writeln!(writer, "{value}");
         }
     }
-    fn event(&mut self, event: Event, anchor: i64) {
+    fn event(&mut self, event: Event, anchor: i64, selected: &[Identity]) {
         let Some((slot, reverse)) = self.match_flow(&event.flow) else { return; };
         let kind = match event.kind {
             EventKind::Connect => 1,
@@ -85,10 +85,11 @@ impl Diagnostics {
             EventKind::Deleted => 5,
         };
         self.line(&format!(
-            "event slot={slot} qpc_rel={} kind={kind} reverse={} owner_valid={}",
+            "event slot={slot} qpc_rel={} kind={kind} reverse={} owner_valid={} owner_selected={}",
             event.timestamp_qpc.saturating_sub(anchor),
             u8::from(reverse),
             u8::from(event.owner.creation_time_100ns != 0),
+            u8::from(selected.contains(&event.owner)),
         ));
     }
     fn packet(
@@ -133,7 +134,7 @@ struct Diagnostics;
 #[cfg(not(debug_assertions))]
 impl Diagnostics {
     fn from_environment() -> Self { Self }
-    fn event(&mut self, _event: Event, _anchor: i64) {}
+    fn event(&mut self, _event: Event, _anchor: i64, _selected: &[Identity]) {}
     fn packet(
         &mut self,
         _at: i64,
@@ -263,7 +264,7 @@ pub fn capture(
     state.lock().finalizing = true;
     let mut ledger = Ledger::new(20_000);
     for event in &capture.events {
-        diagnostics.event(*event, capture.qpc_anchor);
+        diagnostics.event(*event, capture.qpc_anchor, &identities);
         if !ledger.ingest(*event) {
             return Err("Incomplete process evidence; recording discarded".into());
         }
