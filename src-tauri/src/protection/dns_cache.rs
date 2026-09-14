@@ -117,6 +117,7 @@ mod tests {
                 upstream: "127.0.0.1:9".into(),
                 listen_address: "127.0.0.1".into(),
                 listen_port: 0,
+                dual_stack: false,
                 rules: text.into(),
             })?;
             manager.stop()?;

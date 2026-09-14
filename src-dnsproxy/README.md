@@ -42,8 +42,15 @@ The upstream must be a numeric IP address and port; hostnames are rejected so
 startup cannot silently consult the system resolver.  `listen_address` must
 be a loopback IP and defaults to `127.0.0.1`.  `listen_port` accepts `0` for
 OS-assigned test ports and `53` for a production DNS port; the process does
-not request elevation.  A caller that selects port 53 must arrange the
-required Windows privilege and any routing/rollback outside this process.
+not request elevation. The caller owns any privileged Windows DNS configuration
+and routing/rollback outside this process.
+
+Set `dual_stack: true` to bind both `127.0.0.1` and `::1` for UDP and TCP in
+one process, sharing the same filter engine. In that mode, the two canonical
+loopback addresses replace `listen_address`. All four listeners must bind;
+a conflict closes listeners already opened and returns an error. There is no
+silent fallback to one address family. With port `0`, each listener may receive
+a different ephemeral port.
 
 Send `{"op":"stop"}` to shut down and exit.  Closing stdin has the same
 effect after a successful start, which lets a parent process use pipe closure
@@ -79,7 +86,10 @@ Status examples:
 
 The ready status is emitted only after both listeners bind.  The process uses a
 discarded dnsproxy logger and never emits per-query status, so stdout remains a
-small control/status channel for the Tauri supervisor.
+small control/status channel for the Tauri supervisor. Ready messages also
+include `udp_addrs` and `tcp_addrs` arrays listing all bound addresses. The
+legacy singular fields retain the first entry. The Rust supervisor verifies
+that the arrays match the requested families and port before accepting readiness.
 
 ## Filtering behavior
 

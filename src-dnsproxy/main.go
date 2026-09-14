@@ -82,19 +82,25 @@ func (r *serviceRuntime) start(input config) (statusMessage, error) {
 		_ = service.shutdown()
 		return statusMessage{}, err
 	}
-	udpAddr := service.udpAddr()
-	tcpAddr := service.tcpAddr()
-	if udpAddr == "" || tcpAddr == "" {
+	udpAddrs := service.udpAddrs()
+	tcpAddrs := service.tcpAddrs()
+	listenerCount := 1
+	if validated.DualStack {
+		listenerCount = 2
+	}
+	if len(udpAddrs) != listenerCount || len(tcpAddrs) != listenerCount {
 		_ = service.shutdown()
-		return statusMessage{}, errors.New("DNS proxy started without both listener addresses")
+		return statusMessage{}, errors.New("DNS proxy started without the expected listener addresses")
 	}
 
 	r.service = service
 	r.engine = engine
 	return statusMessage{
 		Status:     "ready",
-		UDPAddr:    udpAddr,
-		TCPAddr:    tcpAddr,
+		UDPAddr:    udpAddrs[0],
+		TCPAddr:    tcpAddrs[0],
+		UDPAddrs:   udpAddrs,
+		TCPAddrs:   tcpAddrs,
 		RulesCount: engine.rulesCount(),
 	}, nil
 }

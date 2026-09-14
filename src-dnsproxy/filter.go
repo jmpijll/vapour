@@ -43,6 +43,7 @@ type config struct {
 	Upstream      string `json:"upstream"`
 	ListenAddress string `json:"listen_address,omitempty"`
 	ListenPort    int    `json:"listen_port,omitempty"`
+	DualStack     bool   `json:"dual_stack,omitempty"`
 	Rules         string `json:"rules,omitempty"`
 }
 
@@ -53,11 +54,13 @@ type command struct {
 }
 
 type statusMessage struct {
-	Status     string `json:"status"`
-	Error      string `json:"error,omitempty"`
-	UDPAddr    string `json:"udp_addr,omitempty"`
-	TCPAddr    string `json:"tcp_addr,omitempty"`
-	RulesCount uint64 `json:"rules_count,omitempty"`
+	Status     string   `json:"status"`
+	Error      string   `json:"error,omitempty"`
+	UDPAddr    string   `json:"udp_addr,omitempty"`
+	TCPAddr    string   `json:"tcp_addr,omitempty"`
+	UDPAddrs   []string `json:"udp_addrs,omitempty"`
+	TCPAddrs   []string `json:"tcp_addrs,omitempty"`
+	RulesCount uint64   `json:"rules_count,omitempty"`
 }
 
 // domainDecision is intentionally small because the command protocol only
@@ -258,20 +261,23 @@ func newDNSService(cfg config, engine *domainEngine) (*dnsService, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse explicit DNS upstream: %w", err)
 	}
-	listenIP := net.ParseIP(cfg.ListenAddress)
+	listenIPs := []net.IP{net.ParseIP(cfg.ListenAddress)}
+	if cfg.DualStack {
+		listenIPs = []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")}
+	}
+	udpListenAddrs := make([]*net.UDPAddr, 0, len(listenIPs))
+	tcpListenAddrs := make([]*net.TCPAddr, 0, len(listenIPs))
+	for _, listenIP := range listenIPs {
+		udpListenAddrs = append(udpListenAddrs, &net.UDPAddr{IP: listenIP, Port: cfg.ListenPort})
+		tcpListenAddrs = append(tcpListenAddrs, &net.TCPAddr{IP: listenIP, Port: cfg.ListenPort})
+	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	service := &dnsService{}
 	service.engine.Store(engine)
 	server, err := dnsproxy.New(&dnsproxy.Config{
-		Logger: logger,
-		UDPListenAddr: []*net.UDPAddr{{
-			IP:   listenIP,
-			Port: cfg.ListenPort,
-		}},
-		TCPListenAddr: []*net.TCPAddr{{
-			IP:   listenIP,
-			Port: cfg.ListenPort,
-		}},
+		Logger:         logger,
+		UDPListenAddr:  udpListenAddrs,
+		TCPListenAddr:  tcpListenAddrs,
 		UpstreamConfig: upstreams,
 		RequestHandler: filteringHandler{engine: &service.engine},
 		CacheEnabled:   false,
@@ -308,23 +314,47 @@ func (s *dnsService) shutdown() error {
 }
 
 func (s *dnsService) udpAddr() string {
-	if s == nil || s.proxy == nil {
-		return ""
-	}
-	if address := s.proxy.Addr(dnsproxy.ProtoUDP); address != nil {
-		return address.String()
+	addresses := s.udpAddrs()
+	if len(addresses) > 0 {
+		return addresses[0]
 	}
 	return ""
 }
 
 func (s *dnsService) tcpAddr() string {
-	if s == nil || s.proxy == nil {
-		return ""
-	}
-	if address := s.proxy.Addr(dnsproxy.ProtoTCP); address != nil {
-		return address.String()
+	addresses := s.tcpAddrs()
+	if len(addresses) > 0 {
+		return addresses[0]
 	}
 	return ""
+}
+
+func (s *dnsService) udpAddrs() []string {
+	if s == nil || s.proxy == nil {
+		return nil
+	}
+	addresses := s.proxy.Addrs(dnsproxy.ProtoUDP)
+	result := make([]string, 0, len(addresses))
+	for _, address := range addresses {
+		if address != nil {
+			result = append(result, address.String())
+		}
+	}
+	return result
+}
+
+func (s *dnsService) tcpAddrs() []string {
+	if s == nil || s.proxy == nil {
+		return nil
+	}
+	addresses := s.proxy.Addrs(dnsproxy.ProtoTCP)
+	result := make([]string, 0, len(addresses))
+	for _, address := range addresses {
+		if address != nil {
+			result = append(result, address.String())
+		}
+	}
+	return result
 }
 
 type filteringHandler struct {

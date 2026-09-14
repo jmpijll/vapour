@@ -73,6 +73,8 @@ pub struct DnsProcessConfig {
     #[serde(default)]
     pub listen_port: u16,
     #[serde(default)]
+    pub dual_stack: bool,
+    #[serde(default)]
     pub rules: String,
 }
 
@@ -82,6 +84,8 @@ pub struct DnsProcessConfig {
 pub struct DnsProcessStatus {
     pub udp_addr: String,
     pub tcp_addr: String,
+    pub udp_addrs: Vec<String>,
+    pub tcp_addrs: Vec<String>,
     pub rules_count: u64,
 }
 
@@ -107,6 +111,10 @@ struct WireStatus {
     udp_addr: Option<String>,
     #[serde(default)]
     tcp_addr: Option<String>,
+    #[serde(default)]
+    udp_addrs: Option<Vec<String>>,
+    #[serde(default)]
+    tcp_addrs: Option<Vec<String>>,
     #[serde(default)]
     rules_count: Option<u64>,
 }
@@ -232,8 +240,18 @@ impl DnsProcessManager {
             return Err("DNS proxy is already running".to_owned());
         }
 
+        let expected = (
+            config.listen_address.clone(),
+            config.listen_port,
+            config.dual_stack,
+            config.upstream.clone(),
+        );
         let mut running = Running::launch(&self.appdata_path, config)?;
-        let status = match running.wait_ready() {
+        let ready = running.wait_ready().and_then(|status| {
+            validate_listeners(&status, &expected.0, expected.1, expected.2, &expected.3)?;
+            Ok(status)
+        });
+        let status = match ready {
             Ok(status) => status,
             Err(error) => {
                 force_terminate(&mut running);
@@ -328,6 +346,7 @@ impl DnsProcessManager {
             // Port zero requests an OS-assigned high ephemeral port and
             // avoids requiring administrative privileges for validation.
             listen_port: 0,
+            dual_stack: false,
             rules: rules.to_owned(),
         })?;
         validator.stop()?;
@@ -1070,11 +1089,68 @@ fn ready_status(status: WireStatus) -> Result<DnsProcessStatus, String> {
         .tcp_addr
         .ok_or_else(|| "DNS proxy ready status omitted tcp_addr".to_owned())?;
     validate_ready_address("tcp_addr", &tcp_addr)?;
+    let udp_addrs = status.udp_addrs.unwrap_or_else(|| vec![udp_addr.clone()]);
+    let tcp_addrs = status.tcp_addrs.unwrap_or_else(|| vec![tcp_addr.clone()]);
+    for (primary, addresses) in [(&udp_addr, &udp_addrs), (&tcp_addr, &tcp_addrs)] {
+        if addresses.is_empty() || addresses.len() > 2 || addresses.first() != Some(primary) {
+            return Err("DNS proxy listener list is inconsistent".into());
+        }
+        for address in addresses {
+            validate_ready_address("listener", address)?;
+        }
+    }
     Ok(DnsProcessStatus {
         udp_addr,
         tcp_addr,
+        udp_addrs,
+        tcp_addrs,
         rules_count: status.rules_count.unwrap_or(0),
     })
+}
+
+fn validate_listeners(
+    status: &DnsProcessStatus,
+    listen_address: &str,
+    port: u16,
+    dual_stack: bool,
+    upstream: &str,
+) -> Result<(), String> {
+    let mut expected: Vec<IpAddr> = if dual_stack {
+        vec!["127.0.0.1".parse().unwrap(), "::1".parse().unwrap()]
+    } else {
+        vec![if listen_address.trim().is_empty() {
+            "127.0.0.1"
+        } else {
+            listen_address.trim()
+        }
+        .parse()
+        .map_err(|_| "invalid expected DNS listener")?]
+    };
+    expected.sort_unstable();
+    let upstream: SocketAddr = upstream
+        .trim()
+        .parse()
+        .map_err(|_| "invalid expected upstream")?;
+    for addresses in [&status.udp_addrs, &status.tcp_addrs] {
+        let mut observed = Vec::new();
+        for address in addresses {
+            let address: SocketAddr = address.parse().map_err(|_| "invalid DNS listener")?;
+            if address.ip().to_canonical() == upstream.ip().to_canonical()
+                && address.port() == upstream.port()
+            {
+                return Err("DNS proxy upstream points back to its own listener".into());
+            }
+            if port != 0 && address.port() != port {
+                return Err("DNS proxy did not bind the requested port".into());
+            }
+            observed.push(address.ip());
+        }
+        observed.sort_unstable();
+        if observed != expected {
+            return Err("DNS proxy did not bind every requested address family".into());
+        }
+    }
+    Ok(())
 }
 
 fn validate_ready_address(name: &str, address: &str) -> Result<(), String> {
@@ -1434,6 +1510,44 @@ impl Drop for Running {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn listener_readiness_requires_complete_requested_bindings() {
+        let wire = serde_json::json!({
+            "status":"ready", "udp_addr":"127.0.0.1:5300", "tcp_addr":"127.0.0.1:5300",
+            "udp_addrs":["127.0.0.1:5300", "[::1]:5300"],
+            "tcp_addrs":["127.0.0.1:5300", "[::1]:5300"], "rules_count":1
+        });
+        let status = ready_status(serde_json::from_value(wire.clone()).unwrap()).unwrap();
+        assert!(validate_listeners(&status, "127.0.0.1", 5300, true, "192.0.2.53:53").is_ok());
+        assert!(validate_listeners(&status, "127.0.0.1", 53, true, "192.0.2.53:53").is_err());
+        assert!(validate_listeners(&status, "127.0.0.1", 5300, true, "[::1]:5300").is_err());
+        assert!(
+            validate_listeners(&status, "127.0.0.1", 5300, true, "[::ffff:127.0.0.1]:5300")
+                .is_err()
+        );
+        let mut missing = status.clone();
+        missing.tcp_addrs.pop();
+        assert!(validate_listeners(&missing, "127.0.0.1", 5300, true, "192.0.2.53:53").is_err());
+        let mut duplicate = status;
+        duplicate.udp_addrs[1] = duplicate.udp_addrs[0].clone();
+        assert!(validate_listeners(&duplicate, "127.0.0.1", 5300, true, "192.0.2.53:53").is_err());
+        let mut wrong_primary = wire;
+        wrong_primary["udp_addr"] = serde_json::json!("127.0.0.1:5301");
+        assert!(ready_status(serde_json::from_value(wrong_primary).unwrap()).is_err());
+    }
+
+    #[test]
+    fn legacy_single_listener_readiness_cannot_claim_dual_stack() {
+        let status = ready_status(
+            serde_json::from_value(serde_json::json!({
+                "status":"ready", "udp_addr":"127.0.0.1:5300", "tcp_addr":"127.0.0.1:5301"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(validate_listeners(&status, "", 0, false, "192.0.2.53:53").is_ok());
+        assert!(validate_listeners(&status, "", 0, true, "192.0.2.53:53").is_err());
+    }
     use std::{
         net::UdpSocket,
         sync::atomic::{AtomicU64, Ordering},
@@ -1465,6 +1579,7 @@ mod tests {
             upstream: upstream.to_string(),
             listen_address: "127.0.0.1".to_owned(),
             listen_port: 0,
+            dual_stack: false,
             rules: "||ads.example^\n@@||allowed.ads.example^".to_owned(),
         }
     }
@@ -1603,7 +1718,12 @@ mod tests {
 
     #[cfg(windows)]
     fn query_udp(address: SocketAddr, name: &str, qtype: u16) -> Vec<u8> {
-        let socket = UdpSocket::bind("127.0.0.1:0").expect("bind DNS query socket");
+        let socket = UdpSocket::bind(if address.is_ipv6() {
+            "[::1]:0"
+        } else {
+            "127.0.0.1:0"
+        })
+        .expect("bind DNS query socket");
         socket
             .set_read_timeout(Some(Duration::from_secs(3)))
             .expect("set DNS query timeout");
@@ -1615,6 +1735,67 @@ mod tests {
             .expect("receive DNS response");
         response.truncate(length);
         response
+    }
+
+    #[cfg(windows)]
+    fn query_tcp(address: SocketAddr, name: &str, qtype: u16) -> Vec<u8> {
+        let timeout = Duration::from_secs(3);
+        let mut socket = std::net::TcpStream::connect_timeout(&address, timeout).unwrap();
+        socket.set_read_timeout(Some(timeout)).unwrap();
+        socket.set_write_timeout(Some(timeout)).unwrap();
+        let query = dns_query(name, qtype);
+        socket
+            .write_all(&(query.len() as u16).to_be_bytes())
+            .unwrap();
+        socket.write_all(&query).unwrap();
+        let mut size = [0u8; 2];
+        socket.read_exact(&mut size).unwrap();
+        let mut response = vec![0u8; usize::from(u16::from_be_bytes(size))];
+        socket.read_exact(&mut response).unwrap();
+        response
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "Starts dual-stack loopback companion with synthetic upstream; no system DNS changes"]
+    fn live_dual_stack_filters_udp_tcp_and_reloads_one_engine() {
+        let upstream = SyntheticUpstream::start();
+        let manager = DnsProcessManager::new(test_directory("dual-stack"));
+        let mut input = config(upstream.address);
+        input.dual_stack = true;
+        let initial = manager
+            .start(input)
+            .expect("both families must become ready");
+        assert_eq!(initial.udp_addrs.len(), 2);
+        assert_eq!(initial.tcp_addrs.len(), 2);
+        for (addresses, tcp) in [(&initial.udp_addrs, false), (&initial.tcp_addrs, true)] {
+            for address in addresses {
+                let address: SocketAddr = address.parse().unwrap();
+                for (name, rcode) in [("ads.example", 3), ("allowed.ads.example", 0)] {
+                    let response = if tcp {
+                        query_tcp(address, name, 28)
+                    } else {
+                        query_udp(address, name, 28)
+                    };
+                    assert_eq!(response_rcode(&response), rcode);
+                    assert_eq!(
+                        response_answer_count(&response),
+                        if rcode == 0 { 1 } else { 0 }
+                    );
+                }
+            }
+        }
+        let reloaded = manager.reload("||new.example^".into()).unwrap();
+        assert_eq!(initial.udp_addrs, reloaded.udp_addrs);
+        assert_eq!(initial.tcp_addrs, reloaded.tcp_addrs);
+        for address in &reloaded.udp_addrs {
+            assert_eq!(
+                response_rcode(&query_udp(address.parse().unwrap(), "new.example", 1)),
+                3
+            );
+        }
+        manager.stop().unwrap();
+        assert!(manager.status().unwrap().is_none());
     }
 
     #[cfg(windows)]
@@ -1743,6 +1924,7 @@ mod tests {
             upstream: "resolver.example.test:53".to_owned(),
             listen_address: "127.0.0.1".to_owned(),
             listen_port: 0,
+            dual_stack: false,
             rules: String::new(),
         });
         assert!(result
@@ -1803,6 +1985,7 @@ mod tests {
                 upstream: upstream.address().to_string(),
                 listen_address: "127.0.0.1".to_owned(),
                 listen_port: 0,
+                dual_stack: false,
                 rules: "||old.example.test^\n@@||allowed.example.test^".to_owned(),
             })
             .expect("real DNS companion should start");
