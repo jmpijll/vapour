@@ -14,6 +14,10 @@ tests because a new proxy socket can have different process/compartment policy.
 
 ## Implementation increments
 
+The pure packet codec in `src-tauri/src/protection/dns_packet.rs` is implemented
+and passes eleven unit tests. It performs no interception. Flow mapping,
+reply ownership, driver forwarding and companion integration below remain open.
+
 1. Implement a pure IPv4/IPv6 packet reflection and mapping module. Retain the
    original local address, resolver address, interface, transport and ports.
    Validate IP and transport lengths, reject unsupported fragments/extensions,

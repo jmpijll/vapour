@@ -39,7 +39,7 @@ endpoint. A selected server's Accept can authorize subsequent packets even when
 the peer's Connect preceded the SYN. Conflicting same-side ownership remains
 ambiguous. Regression tests also reject a stale selected Accept before a newer
 peer Connect, including the later handshake and payload packets. The full Rust
-library suite passes 221 tests, with 27 environment/native tests explicitly
+library suite passes 232 tests, with 27 environment/native tests explicitly
 ignored; the expanded release harness passes 86 offline tests.
 
 The bounded UDP owner-module snapshot is verified against held IPv4/IPv6

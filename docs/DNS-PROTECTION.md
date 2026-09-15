@@ -6,6 +6,11 @@ the filtering companion.
 
 ## Implemented boundaries
 
+- A pure packet codec validates exact IP/transport lengths and rewrites
+  same-family IPv4/IPv6 TCP/UDP tuples with recalculated checksums. It rejects
+  fragments, IPv6 extension headers, IPv4 source routes and malformed options.
+  IPv6 scope metadata belongs to the later routing layer, not the wire codec.
+  This module does not intercept traffic or authorize a flow.
 - The source-built companion listens on loopback and accepts an explicit numeric
   upstream. Rust verifies the embedded executable and supervises its lifetime.
 - An elevated caller launches the companion with the desktop user's primary
@@ -46,6 +51,13 @@ the filtering companion.
 
 ## Verified without system DNS changes
 
+Eleven packet-codec tests cover all four address-family/transport combinations,
+payload and TCP-header preservation, independent checksum assertions, computed
+UDP-zero encoding, every truncated fixture prefix, trailing bytes, malformed
+lengths/options, fragments and unsupported extensions. The combined Rust suite
+passes 232 tests, with 27 native/environment tests explicitly ignored. No active
+driver forwarding is exercised by these codec tests.
+
 Real companion tests cover initial filtering, live reload, invalid-replacement
 preservation and separate parser validation. Hidden-process watchdog tests cover
 readiness while the parent is alive, waiting until parent exit, and failed
@@ -83,9 +95,22 @@ not VPN-policy coverage or compatibility with older Windows versions.
 Calling it after pointing system DNS back at this
 proxy would risk recursion, so it is not a drop-in upstream replacement.
 
-These checks do not establish end-to-end protection. The remaining work includes
-protected journal creation and restore on this system,
-watchdog launch and handshake integration, upstream selection, IPv4/IPv6 routing,
-proxy failure recovery, graceful shutdown, restart recovery, periodic updates,
-and the UI switch. DoH, VPN and per-application resolver behavior also need
-explicit coverage before broader protection claims.
+The next implementation follows the
+[transparent routing plan](superpowers/plans/2026-09-15-transparent-dns.md):
+intercept conventional UDP/TCP port 53 traffic with a separate active WinDivert
+handle and retain the original resolver destination selected by Windows. The
+companion needs authenticated per-flow routing and owned upstream sockets before
+this can replace its current fixed-upstream test configuration. Adapter DNS
+settings remain unchanged in this design. The existing configuration journal
+and watchdog are groundwork for the alternative adapter-rewrite approach; they
+must not be enabled alongside transparent interception.
+
+These checks do not establish end-to-end protection. Remaining work includes
+bounded packet/flow reflection, dual-stack listeners and forwarding, prevention
+of recursive interception, helper/driver failure recovery, graceful shutdown,
+restart, periodic updates and the UI switch. Native tests must verify that
+adapter settings stay unchanged and that cleanup restores ordinary packet flow.
+VPN, NRPT and per-application routing still need explicit verification: retaining
+the destination alone does not prove equivalent process or compartment policy.
+Encrypted DoH/DoT/DoQ traffic is outside port-53 interception and must not be
+presented as filtered by this mechanism.
