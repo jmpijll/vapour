@@ -88,7 +88,7 @@ fn event(api:&Api,address:Address,cache:&mut HashMap<(u64,u32),Identity>,anchor:
  if owner.creation_time_100ns!=0{cache.insert((endpoint,pid),owner);}
  Some(Event{timestamp_qpc:address.timestamp,endpoint_id:endpoint,owner,flow:Flow{protocol:d[56],local,remote},kind})
 }
-pub fn collect(dll:&Path,cancel:&AtomicBool,max_seconds:u64,ready:SyncSender<Result<(),String>>,diagnostics:&mut super::CaptureLossDetails)->Result<Collection,String>{
+pub fn collect(dll:&Path,cancel:&AtomicBool,max_seconds:u64,ready:SyncSender<Result<(),String>>,diagnostics:&mut super::CaptureLossDetails,mut observe:impl FnMut(&Event,u64)->Result<(),String>)->Result<Collection,String>{
  if BROKEN.load(Ordering::Acquire){return Err("Restart Vapour after the previous capture shutdown failure".into());}
  let api=Api::load(dll)?;let mut frequency=0;let mut anchor=0;let mut filetime=0u64;
  let before_binds=super::bind_snapshot::Snapshot::read().ok();
@@ -143,6 +143,7 @@ pub fn collect(dll:&Path,cancel:&AtomicBool,max_seconds:u64,ready:SyncSender<Res
    if result.udp_binds.as_mut().is_some_and(|binds|!binds.observe(at,local)){return Err("Invalid UDP bind history".into());}
   }
   if let Some(e)=event(&api,address,&mut cache,anchor,filetime as i64,frequency as u64){
+   observe(&e,filetime)?;
    if let Some(prior)=result.tcp_prior.as_mut(){prior.observe(&e);}
    result.events.push(e);
   }else if address.data[56]==6&&matches!((address.bits&255,(address.bits>>8)&255),(2,1|2)|(3,4|6|7)){

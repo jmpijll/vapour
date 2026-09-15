@@ -61,8 +61,13 @@ impl Ledger {
         true
     }
     pub fn classify(&self, flow: &Flow, at: i64, selected: Identity) -> Verdict {
-        if self.invalid || !flow.valid() || at < 0 || selected.pid == 0
-            || selected.creation_time_100ns == 0 { return Verdict::Invalid; }
+        self.classify_any(flow, at, &[selected])
+    }
+    pub fn classify_any(&self, flow: &Flow, at: i64, selected: &[Identity]) -> Verdict {
+        if self.invalid || !flow.valid() || at < 0 || selected.is_empty()
+            || selected.iter().any(|owner| owner.pid == 0 || owner.creation_time_100ns == 0) {
+            return Verdict::Invalid;
+        }
         // Events after the packet cannot authorize or taint it. Offline replay
         // accepts arbitrarily ordered arrival, then uses native event timestamps.
         let mut events: Vec<_> = self.events.iter().filter(|e|
@@ -140,16 +145,26 @@ impl Ledger {
             }
         }
         let active: Vec<_> = intervals.iter().filter(|i| i.end.is_none()).collect();
-        if active.iter().any(|i| i.event.owner == selected) { return Verdict::Selected; }
+        if active.iter().any(|i| selected.contains(&i.event.owner)) { return Verdict::Selected; }
         // Opposite loopback endpoint can still be active after the selected
         // socket closes. That is not proof that a late selected TCP tail is Other.
-        if intervals.iter().any(|i| i.event.owner == selected) { return Verdict::Unknown; }
+        if intervals.iter().any(|i| selected.contains(&i.event.owner)) { return Verdict::Unknown; }
         if !active.is_empty() { Verdict::Other } else { Verdict::Unknown }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn multiple_selected_processes_share_one_flow_classification() {
+        let mut ledger = Ledger::new(10);
+        assert!(ledger.ingest(event(EventKind::Connect, 10)));
+        assert_eq!(ledger.classify_any(&flow(), 11, &[id(200), id(100)]), Verdict::Selected);
+        assert_eq!(ledger.classify_any(&flow(), 11, &[id(200), id(300)]), Verdict::Other);
+        assert_eq!(ledger.classify_any(&flow(), 11, &[]), Verdict::Invalid);
+        assert!(ledger.ingest(event(EventKind::Close, 12)));
+        assert_eq!(ledger.classify_any(&flow(), 13, &[id(200), id(100)]), Verdict::Unknown);
+    }
     use super::*;
     fn id(pid: u32) -> Identity { Identity { pid, creation_time_100ns: 134_337_154_568_108_137 } }
     fn flow() -> Flow { Flow { protocol: 6, local: "127.0.0.1:40000".parse().unwrap(), remote: "127.0.0.1:40001".parse().unwrap() } }

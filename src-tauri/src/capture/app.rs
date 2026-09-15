@@ -248,17 +248,42 @@ fn timestamp(qpc: i64, anchor: i64, filetime: i64, frequency: u64) -> Option<i64
         .filter(|time| *time >= 116444736000000000)
 }
 
+// Resolve the image path and creation time from one held native process handle.
+// A matching PID alone cannot authorize a later process generation. Existing
+// processes not explicitly selected at start are not silently added.
+fn admit_process(
+    selected: &mut Vec<Identity>,
+    owner: Identity,
+    started: u64,
+    verify: impl FnOnce() -> Option<Identity>,
+) -> Result<(), String> {
+    if selected.contains(&owner) || owner.pid == 0 || owner.creation_time_100ns == 0
+        || owner.creation_time_100ns < started {
+        return Ok(());
+    }
+    if verify() == Some(owner) {
+        if selected.len() >= 1024 {
+            return Err("Capture process limit reached; recording discarded".into());
+        }
+        selected.push(owner);
+    }
+    Ok(())
+}
+
 pub fn capture(
     dll: &Path,
     output: &Path,
-    identities: Vec<Identity>,
+    mut identities: Vec<Identity>,
+    expected_path: &str,
     cancel: &AtomicBool,
     state: &Arc<Mutex<CaptureStatus>>,
     ready: SyncSender<Result<(), String>>,
 ) -> Result<(), String> {
     let mut diagnostics = Diagnostics::from_environment();
     let mut loss = super::CaptureLossDetails::default();
-    let result = windivert::collect(dll, cancel, super::MAX_SECONDS, ready, &mut loss);
+    let result = windivert::collect(dll, cancel, super::MAX_SECONDS, ready, &mut loss,
+        |event, started| admit_process(&mut identities, event.owner, started,
+            || resolve(event.owner.pid, expected_path).ok()));
     state.lock().loss_details = loss;
     let mut capture = result?;
     state.lock().finalizing = true;
@@ -329,21 +354,7 @@ pub fn capture(
                 &identities,
             )
         } else {
-            let decisions: Vec<_> = identities
-                .iter()
-                .map(|id| ledger.classify(&flow, at, *id))
-                .collect();
-            if decisions.contains(&Verdict::Invalid) {
-                Verdict::Invalid
-            } else if decisions.contains(&Verdict::Ambiguous) {
-                Verdict::Ambiguous
-            } else if decisions.contains(&Verdict::Selected) {
-                Verdict::Selected
-            } else if decisions.contains(&Verdict::Unknown) {
-                Verdict::Unknown
-            } else {
-                Verdict::Other
-            }
+            ledger.classify_any(&flow, at, &identities)
         };
         let verdict = if info.protocol == 6 && matches!(verdict, Verdict::Unknown | Verdict::Other)
             && prior_tcp == Verdict::Selected {
@@ -417,6 +428,46 @@ pub fn capture(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn process_path_verification_uses_the_live_process_generation() {
+        let path = std::env::current_exe().unwrap();
+        let pid = std::process::id();
+        let owner = super::resolve(pid, path.to_str().unwrap()).unwrap();
+        assert_eq!(owner.pid, pid);
+        assert_ne!(owner.creation_time_100ns, 0);
+        assert_eq!(Some(owner), super::super::windivert::identity(pid));
+        assert!(super::resolve(pid, "C:\\not-the-selected-app.exe").is_err());
+    }
+    #[test]
+    fn new_process_selection_requires_verified_generation_and_start_boundary() {
+        use super::*;
+        let initial = Identity { pid: 1, creation_time_100ns: 10 };
+        let new = Identity { pid: 2, creation_time_100ns: 110 };
+        let mut selected = vec![initial];
+        admit_process(&mut selected, new, 100, || Some(new)).unwrap();
+        assert_eq!(selected, vec![initial, new]);
+        admit_process(&mut selected, new, 100, || panic!("already verified")).unwrap();
+        let old = Identity { pid: 3, creation_time_100ns: 99 };
+        admit_process(&mut selected, old, 100, || panic!("preexisting process")).unwrap();
+        let reused = Identity { pid: 4, creation_time_100ns: 120 };
+        admit_process(&mut selected, reused, 100, || Some(Identity { creation_time_100ns: 121, ..reused })).unwrap();
+        admit_process(&mut selected, reused, 100, || None).unwrap();
+        admit_process(&mut selected, Identity { pid: 5, creation_time_100ns: 0 }, 100, || panic!("unknown generation")).unwrap();
+        admit_process(&mut selected, Identity { pid: 0, creation_time_100ns: 110 }, 100, || panic!("invalid PID")).unwrap();
+        assert_eq!(selected, vec![initial, new]);
+        let boundary = Identity { pid: 6, creation_time_100ns: 100 };
+        admit_process(&mut selected, boundary, 100, || Some(boundary)).unwrap();
+        assert_eq!(selected, vec![initial, new, boundary]);
+    }
+
+    #[test]
+    fn new_process_selection_is_bounded() {
+        use super::*;
+        let mut selected: Vec<_> = (1..=1024).map(|pid| Identity { pid, creation_time_100ns: 10 }).collect();
+        let new = Identity { pid: 2000, creation_time_100ns: 110 };
+        assert!(admit_process(&mut selected, new, 100, || Some(new)).is_err());
+        assert_eq!(selected.len(), 1024);
+    }
     use super::*;
     #[test]
     fn qpc_conversion_uses_anchor_not_absolute_qpc() {
