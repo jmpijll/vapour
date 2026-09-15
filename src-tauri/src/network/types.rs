@@ -22,7 +22,16 @@ pub struct InterfaceInfo {
     pub ipv6: Option<String>,
     pub download_speed_bps: u64,
     pub upload_speed_bps: u64,
-    pub is_default_gateway: bool,
+    pub receive_link_speed_bps: Option<u64>,
+    pub transmit_link_speed_bps: Option<u64>,
+    pub is_default_gateway: Option<bool>,
+    pub details: super::adapter::AdapterDetails,
+    pub driver: super::driver_cache::DriverObservation,
+    pub wifi: Option<super::wifi_cache::WifiObservation>,
+    pub ip_configuration: Option<super::ip_config::IpConfiguration>,
+    pub ip_configuration_status: String,
+    pub route_configuration: Option<super::routes::RouteConfiguration>,
+    pub route_configuration_status: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,6 +62,7 @@ pub struct SocketStream {
     pub remote_ip: String,
     pub remote_port: u16,
     pub remote_host: Option<String>,
+    pub destination_tags: Option<super::destination_tags::DestinationTagLookup>,
     pub country_code: Option<String>,
     pub country_name: Option<String>,
     pub cloud_provider: Option<String>,

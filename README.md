@@ -46,7 +46,7 @@ This is an early, source-first alpha. There is no signed installer or stable bin
 
 ### Requirements
 
-- Windows with WebView2 and the Visual Studio C++ build tools / Windows SDK.
+- Windows 10/11 x64 with WebView2 and the Visual Studio C++ build tools / Windows SDK.
 - Node.js 24 LTS and pnpm 11.27.0.
 - Rust through rustup; `rust-toolchain.toml` selects the tested Windows MSVC toolchain.
 - Go 1.27.1 (tested); the speedtest module requires at least Go 1.26.
@@ -74,7 +74,7 @@ This alpha favours excluding uncertain data over presenting guesses as facts.
 | Area | Current boundary |
 | --- | --- |
 | App measurements | Require administrator access. Very short-lived processes, event loss and sustained load need broader validation. |
-| Appcapture | Marked **Partial**. Focuses on evidenced new connections of processes present at capture start. Existing connections, all TCP patterns and complete inbound/server coverage are not supported. Counts are finalized on stop. |
+| Appcapture | Marked **Partial**. Native tests cover new incoming/outgoing TCP/UDP, stable existing TCP connections, and new processes of the selected executable during capture over IPv4/IPv6. Rapid reuse, very short-lived processes and sustained-load coverage remain unverified. Counts are finalized on stop. |
 | Capture limits | Interface/session capture: 60 seconds / 64 MiB. Appcapture: 60 seconds with a 32 MiB collection budget and event limits. Driver queues are additional. Unknown app packets are excluded. |
 | Firewall | Outbound rules only. Rules remain until explicitly removed. Vapour does not enable disabled firewall profiles automatically. |
 | Destination names | Reverse DNS and other labels are hints, not verified service identity. |

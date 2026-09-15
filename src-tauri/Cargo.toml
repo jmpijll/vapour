@@ -48,6 +48,8 @@ ferrisetw = "1.2.0"
 sha2 = "0.10"
 
 socket2 = "0.6"
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
+flate2 = "1.1"
 
 
 [features]

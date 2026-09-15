@@ -10,3 +10,18 @@ pub mod usage;
 pub mod destinations;
 
 mod trace_cleanup;
+
+pub mod adapter;
+
+pub mod ip_config;
+
+pub mod routes;
+
+pub mod wifi_quality;
+pub mod wifi_cache;
+
+pub mod driver_details;
+pub mod driver_cache;
+pub mod destination_tags;
+pub mod tag_database;
+pub mod tag_worker;

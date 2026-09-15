@@ -257,6 +257,11 @@ export function Capture({
             </div>
           </div>
 
+          <details className="advanced-only capture-diagnostics"><summary>Diagnostics</summary>
+            <p className="detail-note">Native loss counters: {status.native_loss_available === undefined ? "Unavailable" : status.native_loss_available ? "Available" : "Unavailable"}</p>
+            {status.loss_details && <dl>{Object.entries(status.loss_details).map(([key,value])=><div className="counter-pair" key={key}><dt>{key.replaceAll("_", " ")}</dt><dd>{value}</dd></div>)}</dl>}
+            {status.path && <p className="detail-note">{status.path}</p>}
+          </details>
           <div className="capture-actions">
             <button
               className="icon-button speedtest-run"

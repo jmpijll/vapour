@@ -17,6 +17,8 @@ import {
   RefreshCw,
   Gauge,
   Circle,
+  ChartNoAxesCombined,
+  Layers,
 } from "lucide-react";
 import { useNetworkTelemetry } from "./hooks/useNetworkTelemetry";
 import { Capture } from "./components/Capture";
@@ -29,6 +31,8 @@ import { History } from "./components/History";
 import { Endpoint } from "./components/Endpoint";
 import { InterfacePicker } from "./components/InterfacePicker";
 import { Rate } from "./components/Rate";
+import { InterfaceStatistics } from "./components/InterfaceStatistics";
+import { ThreatProtection } from "./components/ThreatProtection";
 import { Speedtest } from "./components/Speedtest";
 
 type Preferences = {
@@ -37,6 +41,7 @@ type Preferences = {
   appsOnly: boolean;
   colorIcons: boolean;
   showUnavailableInterfaces: boolean;
+  advanced: boolean;
 };
 const native = "__TAURI_INTERNALS__" in window;
 function loadPreferences(): Preferences {
@@ -48,6 +53,7 @@ function loadPreferences(): Preferences {
       appsOnly: p.appsOnly !== false,
       colorIcons: p.colorIcons === true,
       showUnavailableInterfaces: p.showUnavailableInterfaces === true,
+      advanced: p.advanced === true,
     };
   } catch {
     return {
@@ -56,6 +62,7 @@ function loadPreferences(): Preferences {
       appsOnly: true,
       colorIcons: false,
       showUnavailableInterfaces: false,
+      advanced: false,
     };
   }
 }
@@ -130,7 +137,7 @@ export function App() {
     [systemDark, setSystemDark] = useState(
       () => matchMedia("(prefers-color-scheme: dark)").matches,
     );
-  const [view, setView] = useState<"list" | "detail" | "settings" | "speedtest" | "capture" | "firewall">("list");
+  const [view, setView] = useState<"list" | "detail" | "settings" | "speedtest" | "capture" | "firewall" | "interfaces">("list");
   const [selected, setSelected] = useState<string | null>(null),
     [selectedApp, setSelectedApp] = useState<GroupedProcess | null>(null);
   const [query, setQuery] = useState(""),
@@ -283,13 +290,14 @@ export function App() {
     </main>;
   }
   return (
-    <main className={"vapour-shell " + (native ? "native" : "preview")}>
+    <main data-mode={prefs.advanced ? "advanced" : "basic"} className={"vapour-shell " + (native ? "native" : "preview")}>
       <header className="titlebar">
         <div className="wordmark" data-tauri-drag-region>
           <Mark />
           <span data-tauri-drag-region>Vapour</span>
         </div>
         <div className="toolbar">
+          <button className={"icon-button " + (prefs.advanced ? "selected" : "")} aria-label="Advanced mode" aria-pressed={prefs.advanced} title={prefs.advanced ? "Advanced" : "Basic"} onClick={() => update({advanced: !prefs.advanced})}><Layers size={16}/></button>
           <button
             className={"icon-button " + (isPinned ? "selected" : "")}
             aria-label={isPinned ? "Unpin window" : "Pin window"}
@@ -301,6 +309,7 @@ export function App() {
           </button>
           <button className={"icon-button " + (capture.status.active ? "capture-recording" : "")} aria-label={capture.status.active ? "Capture recording" : "Capture"} title={capture.status.active ? "Capture recording" : "Capture"} onClick={()=>setView("capture")}><Circle size={16}/></button>
           <button className="icon-button" aria-label="Speedtest" title="Speedtest" onClick={()=>setView("speedtest")}><Gauge size={17}/></button>
+          <button className={"icon-button " + (view === "interfaces" ? "selected" : "")} aria-label="Interface statistics" title="Interfaces" onClick={() => setView(view === "interfaces" ? "list" : "interfaces")}><ChartNoAxesCombined size={17}/></button>
           <button className={"icon-button " + (view === "firewall" ? "selected" : "")} aria-label="Firewall" title="Firewall" aria-pressed={view === "firewall"} onClick={() => setView(view === "firewall" ? "list" : "firewall")}><ShieldCheck size={17}/></button>
           <button
             className={"icon-button " + (view === "settings" ? "selected" : "")}
@@ -456,6 +465,7 @@ export function App() {
                   <ProcessIcon app={app} />
                   <span className="process-info">
                     <span className="process-name">{app.displayName}</span>
+                    <small className="advanced-only muted">{app.pids.length} processes · {app.active_sockets_count} connections</small>
                     {measured && (
                       <span className="usage-track">
                         <span
@@ -608,7 +618,7 @@ export function App() {
                 </button> : <span className="detail-note" role="status">App measurements unavailable</span>
               )}
             </div>
-            <div className="path">{activeApp.path || activeApp.name}</div>
+            <div className="path advanced-only">{activeApp.path || activeApp.name}</div>
             <div className="detail-tabs" aria-label="Filter connections">
               {(["all", "external", "local"] as const).map((value) => (
                 <button
@@ -675,12 +685,14 @@ export function App() {
         )}
         {view === "capture" && <Capture sessionAvailable={!capture.session||!!snapshot?.processes.some(p=>p.sockets.some(s=>s.id===capture.session?.socketId&&!s.closed_at&&s.state==="ESTABLISHED"))} appAvailable={captureAppAvailable} showUnavailable={prefs.showUnavailableInterfaces} capture={capture} networkInterfaces={snapshot?.interfaces||[]} back={()=>((capture.session||capture.appTarget)&&selected?setView("detail"):back())} elevated={firewall.elevated} elevate={()=>void firewall.elevate()}/> }
         {view === "speedtest" && <Speedtest back={back} />}
+        {view === "interfaces" && <InterfaceStatistics interfaces={snapshot?.interfaces || []} advanced={prefs.advanced} back={back}/>}
         {view === "firewall" && (
           <section className="settings-view view-enter">
             <div className="page-heading">
               <button className="back-button" onClick={back} aria-label="Back" title="Back"><ArrowLeft size={15}/></button>
               <h1>Firewall</h1>
             </div>
+            <ThreatProtection elevated={firewall.elevated} elevate={()=>void firewall.elevate()}/>
             <div className="blocks-heading">
               <h2>Blocks</h2>
               <button
@@ -699,7 +711,8 @@ export function App() {
                 {firewall.rules.map((rule) => (
                   <div key={rule.id} className="block-row">
                     <div>
-                      <span>{rule.target.path.split(/[\\/]/).pop()}</span>
+                      <span title={rule.target.path}>{rule.target.path.split(/[\\/]/).pop()}</span>
+                      <small className="advanced-only">{rule.target.path}</small>
                       <small>
                         {rule.target.remote_ip
                           ? `${rule.target.protocol} · ${rule.target.remote_ip}:${rule.target.remote_port}`
@@ -805,6 +818,8 @@ export function App() {
                 unavailable.
               </p>
             )}
+            <div className="advanced-only"><p className="detail-note">Native telemetry · Windows x64</p></div>
+            <p className="detail-note">IP Geolocation by <a href="https://db-ip.com" target="_blank" rel="noreferrer">DB-IP</a></p>
             <div className="about">
               <Mark />
               <span>

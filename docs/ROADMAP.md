@@ -12,13 +12,13 @@ This is a direction, not a release schedule. Windows usability and measurement c
 ## Interface and workflow
 
 - Extend the dedicated Firewall page with validated protection sources.
-- Interface statistics: connection state, negotiated link speed and useful Wi-Fi signal information.
+- Extend interface statistics (connection state, traffic and reported link rates) with useful Wi-Fi signal information.
 - A global Basic / Advanced view, developed with concrete UI examples before committing to which controls belong in each mode.
 - Reliable destination tags with clear provenance and unknown states.
 
 ## Curated protection
 
-Investigate reputable threat-intelligence and ad/tracker lists before enabling feed-based blocking. Source quality, redistribution terms, false positives, shared hosting, DNS/DoH/VPN behaviour, safe updates and rollback must be understood first. These features are not implemented yet.
+Investigate reputable threat-intelligence and ad/tracker lists before enabling feed-based blocking. Source quality, redistribution terms, false positives, shared hosting, DNS/DoH/VPN behaviour, safe updates and rollback must be understood first. Threat-feed download, atomic cache, a persistent switch and Windows firewall rule replacement are implemented. An isolated live TCP test verifies blocking, a control connection and cleanup; broader protocol coverage and sustained operation remain to be tested. The source-built DNS companion passes UDP/TCP filtering tests, but system DNS routing, crash recovery and the ad/tracker toggle remain in progress.
 
 ## Platforms
 

@@ -837,3 +837,38 @@ button.speedtest-server:disabled { cursor:default; }
 
 .capture-target {display:flex;align-items:center;gap:8px;color:var(--muted);font-size:12px;margin:0 0 16px;}
 .capture-target span {flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+
+.interface-stat { padding: 20px 0; border-bottom: 1px solid var(--border); }
+.interface-stat-heading { display: flex; gap: 10px; align-items: center; }
+.interface-stat-heading h2 { font-size: 14px; margin: 0 0 3px; }
+.interface-stat-heading .muted, .interface-description { font-size: 11px; }
+.interface-description { overflow-wrap: anywhere; margin: 12px 0 18px; }
+.interface-rates { display: flex; justify-content: space-between; gap: 10px; }
+.interface-rates .speed-value { font-size: 22px; }
+.interface-link { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 18px; font-size: 11px; }
+.interface-link > span { display: inline-flex; align-items: center; gap: 4px; }
+@media (max-width: 390px) { .titlebar { padding-inline: 12px; gap: 4px; } .toolbar { gap: 0; } .toolbar .icon-button { width: 27px; } .wordmark { gap: 6px; font-size: 14px; } }
+
+[data-mode="basic"] .advanced-only { display: none !important; }
+.adapter-details { margin-top: 18px; font-size: 11px; }
+.adapter-details details { border-top: 1px solid var(--border); padding: 10px 0; }
+.adapter-details summary { cursor: pointer; font-weight: 500; }
+.adapter-details dl { display: grid; grid-template-columns: minmax(75px,1fr) minmax(0,2fr); gap: 8px; margin-top: 12px; }
+.adapter-details dt { color: var(--muted); }
+.adapter-details dd { margin: 0; overflow-wrap: anywhere; }
+.counter-pair { display: contents; }
+.adapter-route { padding: 8px 0; overflow-wrap: anywhere; }
+@media (max-width: 390px) { .wordmark > span { display: none; } }
+
+.capture-diagnostics { font-size: 11px; margin: 16px 0; }
+.capture-diagnostics dl { display: grid; grid-template-columns: 1fr auto; gap: 6px; }
+.capture-diagnostics dd { margin: 0; }
+
+.wifi-quality { display: flex; align-items: center; gap: 8px; margin-top: 14px; color: var(--muted); font-size: 11px; }
+.wifi-quality meter { width: 70px; height: 7px; }
+.wifi-quality meter::-webkit-meter-bar { background: var(--border); border: none; }
+.wifi-quality meter::-webkit-meter-optimum-value { background: var(--muted); }
+
+.threat-protection{margin-bottom:24px}.threat-protection h2,.threat-actions{display:flex;align-items:center;gap:10px}
+
+.destination-tag{display:inline-flex;align-items:center;gap:4px}.destination-organization{max-width:170px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
