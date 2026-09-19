@@ -9,6 +9,13 @@ Run each command separately from the repository root. Do not run the entire
 ignored test set: it includes unrelated privileged and environment-dependent
 tests.
 
+Alternatively, run `./scripts/test-dns-native.ps1` from an administrator terminal
+while the owner is present. It executes exactly these three cases in sequence,
+stops on the first failure (including an empty test selection), and saves private
+logs plus `results.json` to a new temporary directory. It never requests elevation
+itself. `./scripts/test-dns-native.ps1 -ListOnly` lists the cases without running
+tests or requiring administrator access.
+
 ```powershell
 cargo test --manifest-path src-tauri/Cargo.toml --locked --lib protection::dns_divert::tests::native_loopback_udp_tcp_passthrough_and_cleanup -- --ignored --exact --nocapture
 cargo test --manifest-path src-tauri/Cargo.toml --locked --lib protection::dns_session_native_tests::native_session_filters_ipv4_udp_tcp_and_restores_direct_dns -- --ignored --exact --nocapture
@@ -30,6 +37,8 @@ Each session test must prove all of the following:
 - Reloading rules blocks the previously allowed name over UDP and TCP without
   replacing the session. Restoring the rules permits it again.
 - Session stop finishes within its deadline.
+- A concurrent generation is refused while the first is active. After cleanup,
+  a replacement generation starts, filters both transports and stops cleanly.
 - After stop, a subdomain of the blocked rule reaches the resolver normally
   over both transports. The server sees exactly six forwarded requests total.
 

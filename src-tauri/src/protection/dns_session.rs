@@ -96,6 +96,7 @@ struct SessionState {
     state: AtomicU8,
     first_error: Mutex<Option<String>>,
     cleanup_complete: AtomicBool,
+    rollover_requested: AtomicBool,
 }
 
 impl SessionState {
@@ -104,6 +105,7 @@ impl SessionState {
             state: AtomicU8::new(DnsSessionState::Starting as u8),
             first_error: Mutex::new(None),
             cleanup_complete: AtomicBool::new(false),
+            rollover_requested: AtomicBool::new(false),
         }
     }
 
@@ -522,6 +524,10 @@ impl DnsSession {
         self.state.cleanup_complete.load(Ordering::Acquire)
     }
 
+    pub(crate) fn rollover_requested(&self) -> bool {
+        self.state.rollover_requested.load(Ordering::Acquire)
+    }
+
     /// Submit a serialized live rule reload. A caller timeout only bounds the
     /// wait for the acknowledgement; the supervisor keeps processing the
     /// command and retains ownership if the helper reports uncertainty.
@@ -643,6 +649,10 @@ fn worker_loop(handle: &ActiveHandle, core: &SessionCore) -> Result<(), String> 
             Err(RouteError::InvalidPacket)
             | Err(RouteError::Reflection(super::dns_flow::FlowError::Packet(_))) => {
                 RoutedPacket::Discard
+            }
+            Err(RouteError::RolloverRequired) => {
+                core.state.rollover_requested.store(true, Ordering::Release);
+                return Err("DNS session requires a fresh connection generation".into());
             }
             Err(error) => return Err(format!("DNS packet routing failed: {error:?}")),
         };

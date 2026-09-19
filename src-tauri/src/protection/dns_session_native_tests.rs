@@ -254,6 +254,19 @@ fn native_session_case(local: &str, resolver: &str) {
         )
         .expect("native DNS session should start"),
     );
+    let overlap = DnsSession::start(
+        directory.join("overlap-helper"),
+        directory.join("driver"),
+        TransparentDnsConfig {
+            listen_addresses: vec![local.to_string()],
+            listen_port: 0,
+            rules: "||blocked.example.test^".into(),
+        },
+    );
+    assert!(
+        matches!(overlap, Err(ref error) if error.contains("generation is active")),
+        "a second generation must be refused while interception is owned"
+    );
     for tcp in [false, true] {
         let blocked = exchange(local, resolver, tcp, "blocked.example.test");
         assert_eq!(&blocked[..2], &[0x71, 0x42]);
@@ -304,6 +317,36 @@ fn native_session_case(local: &str, resolver: &str) {
     assert_eq!(server.seen.load(Ordering::Acquire), 6);
     assert!(!server.unexpected.load(Ordering::Acquire));
     drop(session);
+    // The final supervisor Arc can outlive the stop reply briefly. Retry only
+    // the explicit admission-busy outcome, never a helper or driver failure.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let replacement = loop {
+        match DnsSession::start(
+            directory.join("helper"),
+            directory.join("driver"),
+            TransparentDnsConfig {
+                listen_addresses: vec![local.to_string()],
+                listen_port: 0,
+                rules: "||blocked.example.test^".into(),
+            },
+        ) {
+            Ok(session) => break SessionGuard(session),
+            Err(error) if error.contains("generation is active") && Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => panic!("replacement generation failed: {error}"),
+        }
+    };
+    for tcp in [false, true] {
+        let blocked = exchange(local, resolver, tcp, "blocked.example.test");
+        assert_eq!(blocked[3] & 15, 3);
+    }
+    replacement
+        .0
+        .stop(Duration::from_secs(10))
+        .expect("replacement cleanup");
+    assert_eq!(server.seen.load(Ordering::Acquire), 6);
+    drop(replacement);
     drop(server);
     let _ = std::fs::remove_dir_all(directory);
 }
