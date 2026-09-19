@@ -182,6 +182,14 @@ ownership is retained. Such uncertainty requests ordered session cleanup;
 ordinary rule rejection leaves the session running. A caller timeout means
 reload is pending, not that its rules were rolled back.
 
+Session replacement now has a separate cleanup-complete signal: failure or a
+stop timeout alone never means resources are released. A process-local generation
+lease also covers failed starts and their detached cleanup, rejecting another
+start until the last owner exits after confirmed cleanup. Unconfirmed cleanup
+keeps admission closed for the process lifetime. This does not coordinate
+separate Vapour processes; cross-process exclusion and the automatic rollover
+controller remain outstanding.
+
 These checks do not establish end-to-end protection. The driver-backed session
 tests are prepared in [DNS-NATIVE-TESTS.md](DNS-NATIVE-TESTS.md) but have not run.
 Remaining work includes session rollover, topology changes, native failure

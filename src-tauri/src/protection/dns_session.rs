@@ -26,6 +26,40 @@ const SUPERVISOR_POLL: Duration = Duration::from_millis(100);
 const WORKER_POLL: Duration = Duration::from_millis(5);
 const INTERNAL_STOP_TIMEOUT: Duration = Duration::from_secs(15);
 
+static GENERATION_OWNED: AtomicBool = AtomicBool::new(false);
+
+/// Process-local exclusion, retained by detached cleanup as well as workers.
+/// A startup error is not permission to overlap the previous generation.
+struct GenerationLease {
+    gate: &'static AtomicBool,
+    cleanup_confirmed: AtomicBool,
+}
+impl GenerationLease {
+    fn acquire() -> Result<Arc<Self>, String> {
+        Self::acquire_from(&GENERATION_OWNED)
+    }
+    fn acquire_from(gate: &'static AtomicBool) -> Result<Arc<Self>, String> {
+        gate.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| {
+                Arc::new(Self {
+                    gate,
+                    cleanup_confirmed: AtomicBool::new(false),
+                })
+            })
+            .map_err(|_| "A DNS interception generation is active or still cleaning up".to_owned())
+    }
+    fn confirm_cleanup(&self) {
+        self.cleanup_confirmed.store(true, Ordering::Release);
+    }
+}
+impl Drop for GenerationLease {
+    fn drop(&mut self) {
+        if self.cleanup_confirmed.load(Ordering::Acquire) {
+            self.gate.store(false, Ordering::Release);
+        }
+    }
+}
+
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DnsSessionState {
@@ -61,6 +95,7 @@ impl DnsSessionState {
 struct SessionState {
     state: AtomicU8,
     first_error: Mutex<Option<String>>,
+    cleanup_complete: AtomicBool,
 }
 
 impl SessionState {
@@ -68,6 +103,7 @@ impl SessionState {
         Self {
             state: AtomicU8::new(DnsSessionState::Starting as u8),
             first_error: Mutex::new(None),
+            cleanup_complete: AtomicBool::new(false),
         }
     }
 
@@ -115,9 +151,18 @@ struct SessionCore {
     drain_enabled: AtomicBool,
     finish_without_drain: AtomicBool,
     shutdown_complete: Mutex<Vec<bool>>,
+    // Last field: release admission to a replacement after resource owners.
+    // None is used only by tests which create no interception handles.
+    _generation: Option<Arc<GenerationLease>>,
 }
 
 impl SessionCore {
+    fn confirm_cleanup(&self) {
+        self.state.cleanup_complete.store(true, Ordering::Release);
+        if let Some(generation) = &self._generation {
+            generation.confirm_cleanup();
+        }
+    }
     fn now_ms(&self) -> u64 {
         self.clock.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
     }
@@ -281,17 +326,27 @@ impl DnsSession {
         divert_runtime: impl AsRef<Path>,
         config: TransparentDnsConfig,
     ) -> Result<Self, String> {
+        let generation = GenerationLease::acquire()?;
         let divert_runtime = divert_runtime.as_ref().to_path_buf();
         let state = Arc::new(SessionState::new());
         let manager = Arc::new(DnsProcessManager::new(appdata_path));
         let status = match manager.start_transparent(config) {
             Ok(status) => status,
-            Err(error) => return Err(error),
+            Err(error) => {
+                let stop_error = manager.stop().err();
+                if stop_error.is_none() {
+                    generation.confirm_cleanup();
+                }
+                return Err(join_errors(error, stop_error));
+            }
         };
         let router = match PacketRouter::new(&status) {
             Ok(router) => router,
             Err(error) => {
                 let stop_error = manager.stop().err();
+                if stop_error.is_none() {
+                    generation.confirm_cleanup();
+                }
                 return Err(join_errors(error, stop_error));
             }
         };
@@ -309,6 +364,9 @@ impl DnsSession {
                             // opened handle still owns its exclusion.
                             drop(handles);
                             let stop_error = manager.stop().err();
+                            if stop_error.is_none() {
+                                generation.confirm_cleanup();
+                            }
                             return Err(join_errors(
                                 format!("open DNS interception handle {index}: {error}"),
                                 quiesce_error.or(stop_error),
@@ -318,28 +376,31 @@ impl DnsSession {
                             let retry_manager = Arc::clone(&manager);
                             let retry_handles = handles;
                             let drain = quiesce_error.is_none();
-                            let ownership =
-                                Arc::new(Mutex::new(Some((retry_handles, retry_manager))));
+                            let ownership = Arc::new(Mutex::new(Some((
+                                retry_handles,
+                                retry_manager,
+                                Arc::clone(&generation),
+                            ))));
                             let background = Arc::clone(&ownership);
                             if thread::Builder::new()
                                 .name("vapour-dns-open-cleanup".to_owned())
                                 .spawn(move || {
-                                    let (handles, manager) = background
+                                    let (handles, manager, generation) = background
                                         .lock()
                                         .unwrap_or_else(|error| error.into_inner())
                                         .take()
                                         .expect("exclusive cleanup owner");
-                                    retry_open_cleanup(manager, handles, drain)
+                                    retry_open_cleanup(manager, handles, drain, generation)
                                 })
                                 .is_err()
                             {
                                 // Retain ownership even if Windows cannot create the cleanup thread.
-                                let (handles, manager) = ownership
+                                let (handles, manager, generation) = ownership
                                     .lock()
                                     .unwrap_or_else(|error| error.into_inner())
                                     .take()
                                     .expect("cleanup owner after failed spawn");
-                                retry_open_cleanup(manager, handles, drain);
+                                retry_open_cleanup(manager, handles, drain, generation);
                             }
                             return Err(join_errors(
                                 format!("open DNS interception handle {index}: {error}"),
@@ -362,6 +423,7 @@ impl DnsSession {
             drain_enabled: AtomicBool::new(false),
             finish_without_drain: AtomicBool::new(false),
             shutdown_complete: Mutex::new(vec![false; handles.len()]),
+            _generation: Some(Arc::clone(&generation)),
         });
 
         let mut workers = Vec::with_capacity(handles.len());
@@ -451,6 +513,13 @@ impl DnsSession {
 
     pub(crate) fn last_error(&self) -> Option<String> {
         self.state.error()
+    }
+
+    /// Whether native handles and companion reservations have both been
+    /// released. Failed/StopPending alone cannot authorize a replacement:
+    /// a failed worker may still leave cleanup in progress.
+    pub(crate) fn cleanup_complete(&self) -> bool {
+        self.state.cleanup_complete.load(Ordering::Acquire)
     }
 
     /// Submit a serialized live rule reload. A caller timeout only bounds the
@@ -702,8 +771,11 @@ fn run_supervisor(
                     .unwrap_or_else(|error| error.into_inner())
                     .clear();
                 handles.clear();
-                if let Err(error) = manager.stop() {
-                    remember_error(&mut first_error, format!("stop DNS companion: {error}"));
+                match manager.stop() {
+                    Ok(()) => core.confirm_cleanup(),
+                    Err(error) => {
+                        remember_error(&mut first_error, format!("stop DNS companion: {error}"));
+                    }
                 }
                 let result = first_error.clone().map_or(Ok(()), Err);
                 if let Some(error) = first_error {
@@ -897,6 +969,8 @@ fn rollback_workers(
     drop(handles);
     if let Err(error) = manager.stop() {
         errors.push(format!("stop DNS companion: {error}"));
+    } else {
+        core.confirm_cleanup();
     }
     if errors.is_empty() {
         Ok(())
@@ -996,7 +1070,9 @@ fn retry_rollback(
         .unwrap_or_else(|error| error.into_inner())
         .clear();
     drop(handles);
-    let _ = manager.stop();
+    if manager.stop().is_ok() {
+        core.confirm_cleanup();
+    }
 }
 
 fn cleanup_unstarted_handles(handles: &[Arc<ActiveHandle>], drain: bool) -> Result<(), String> {
@@ -1048,6 +1124,7 @@ fn retry_open_cleanup(
     manager: Arc<DnsProcessManager>,
     handles: Vec<Arc<ActiveHandle>>,
     drain: bool,
+    generation: Arc<GenerationLease>,
 ) {
     let mut shutdown_complete = vec![false; handles.len()];
     loop {
@@ -1057,7 +1134,11 @@ fn retry_open_cleanup(
         thread::sleep(WORKER_POLL);
     }
     drop(handles);
-    let _ = manager.stop();
+    if manager.stop().is_ok() {
+        generation.confirm_cleanup();
+    }
+    drop(manager);
+    drop(generation);
 }
 
 fn drain_after_shutdown(handle: &ActiveHandle) -> Result<(), String> {
@@ -1094,6 +1175,33 @@ mod tests {
     };
 
     #[test]
+    fn generation_replacement_waits_for_confirmed_cleanup_and_last_owner() {
+        static GATE: AtomicBool = AtomicBool::new(false);
+        let generation = GenerationLease::acquire_from(&GATE).unwrap();
+        let retained = Arc::clone(&generation);
+        let (release, wait) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            wait.recv().unwrap();
+            retained.confirm_cleanup();
+        });
+        drop(generation);
+        assert!(GenerationLease::acquire_from(&GATE).is_err());
+        release.send(()).unwrap();
+        worker.join().unwrap();
+        let replacement = GenerationLease::acquire_from(&GATE).unwrap();
+        replacement.confirm_cleanup();
+        drop(replacement);
+        assert!(!GATE.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn unconfirmed_cleanup_never_reopens_generation_admission() {
+        static GATE: AtomicBool = AtomicBool::new(false);
+        drop(GenerationLease::acquire_from(&GATE).unwrap());
+        assert!(GenerationLease::acquire_from(&GATE).is_err());
+    }
+
+    #[test]
     #[ignore = "real unelevated helper only; no WinDivert handle, driver, or DNS settings"]
     fn stop_timeout_retains_helper_until_blocked_worker_finishes() {
         let directory = std::env::temp_dir().join(format!(
@@ -1123,6 +1231,7 @@ mod tests {
             drain_enabled: AtomicBool::new(false),
             finish_without_drain: AtomicBool::new(false),
             shutdown_complete: Mutex::new(Vec::new()),
+            _generation: None,
         });
         let (release, blocked) = mpsc::channel();
         let retained_core = Arc::clone(&core);
@@ -1168,6 +1277,7 @@ mod tests {
             .status()
             .expect("helper status while worker is blocked")
             .is_some());
+        assert!(!state.cleanup_complete.load(Ordering::Acquire));
         for endpoint in status
             .udp_addrs
             .iter()
@@ -1197,6 +1307,7 @@ mod tests {
             .expect_err("late worker failure must make stop fail")
             .contains("synthetic receive failure"));
         supervisor.join().expect("supervisor should not panic");
+        assert!(state.cleanup_complete.load(Ordering::Acquire));
         assert!(state
             .error()
             .expect("terminal failure remains available")
@@ -1252,6 +1363,7 @@ mod tests {
             drain_enabled: AtomicBool::new(false),
             finish_without_drain: AtomicBool::new(false),
             shutdown_complete: Mutex::new(Vec::new()),
+            _generation: None,
         });
         let (commands, command_receiver) = mpsc::channel();
         let supervisor_core = Arc::clone(&core);
@@ -1273,6 +1385,7 @@ mod tests {
             state,
             supervisor: Some(supervisor),
         };
+        assert!(!session.cleanup_complete());
 
         session
             .reload(
@@ -1307,6 +1420,7 @@ mod tests {
         session
             .stop(Duration::from_secs(3))
             .expect("reload session should stop cleanly");
+        assert!(session.cleanup_complete());
         assert!(manager
             .status()
             .expect("status after session stop")
