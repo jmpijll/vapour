@@ -196,7 +196,12 @@ cleanup before another start. Failed starts and rule updates back off; disabling
 cancels pending replacement. Seven deterministic lifecycle tests verify these
 decisions with injected sessions, including retained cleanup after startup
 failure. The native factory is compiled but not exercised by those tests. A
-background worker, live interface updates and the UI switch are not wired yet.
+background worker now owns reconciliation away from the UI thread, coalesces
+pending configuration changes and retains cleanup after its caller times out or
+drops the handle. Five thread-based tests verify those paths and panic reporting.
+The monitor exposes the full fresh address set with numeric IPv6 scopes; its test
+rejects stale, failed and absent samples. App startup, feed/topology submission
+and the UI switch are not wired yet.
 
 These checks do not establish end-to-end protection. The driver-backed session
 tests are prepared in [DNS-NATIVE-TESTS.md](DNS-NATIVE-TESTS.md) but have not run.

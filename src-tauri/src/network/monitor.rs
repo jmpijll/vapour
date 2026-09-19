@@ -100,6 +100,12 @@ impl NetworkMonitor {
         }
     }
 
+    pub(crate) fn fresh_local_addresses(&self) -> Result<Vec<String>, &'static str> {
+        let now = Instant::now();
+        super::ip_config::request_refresh(&self.ip_configuration, now);
+        self.ip_configuration.lock().fresh_addresses(now)
+    }
+
     fn sample_interfaces(&self, now: Instant) -> (Vec<InterfaceInfo>, u64, u64) {
         let mut interfaces = Vec::new();
         let mut total_down = 0u64;

@@ -19,6 +19,7 @@ pub mod dns_updater;
 pub mod dns_watchdog;
 pub(crate) mod dns_watchdog_cli;
 pub mod dns_watchdog_process;
+pub(crate) mod dns_worker;
 pub mod download;
 pub mod enforcement;
 pub mod feeds;

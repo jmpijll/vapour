@@ -17,8 +17,8 @@ tests because a new proxy socket can have different process/compartment policy.
 The pure packet codec and bounded flow registry are implemented. The registry
 restores only registered reverse tuples and retains the original interface
 metadata. Expired keys remain quarantined for the registry lifetime; the
-internal controller now applies a rollover policy, but its periodic worker and
-native acceptance are still required before this can run continuously.
+internal controller now applies a rollover policy, but application integration
+and native acceptance are still required before this can run continuously.
 
 The separate active driver wrapper now owns receive, reinjection, checksum and
 shutdown APIs. Its unit tests use a fake API. An ignored native probe covers
@@ -58,8 +58,9 @@ Seven router unit tests and two real companion UDP round trips (IPv4/IPv6)
 pass without opening a driver. Slot/flow exhaustion requests rollover; the
 internal generation controller now handles topology replacement and exhausted
 sessions behind the cleanup barrier. Seven injected-session tests cover ordering,
-backoff, rejected updates and cancellation. The periodic worker, live topology
-source and native controller acceptance remain outstanding.
+backoff, rejected updates and cancellation. A background worker and a fresh,
+complete monitor address accessor are implemented and tested separately. Their
+application/feed wiring and native controller acceptance remain outstanding.
 
 Live rule replacement is serialized by the session supervisor with stop. A
 structured parser rejection keeps the existing rules and session; an uncertain

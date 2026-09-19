@@ -120,6 +120,19 @@ impl ConfigCache {
 
     pub fn routes(&self, luid: u64) -> Option<super::routes::RouteConfiguration> { self.routes.get(&luid).cloned() }
     pub fn get(&self, luid: u64) -> Option<IpConfiguration> { self.values.get(&luid).cloned() }
+
+    /// Complete, fresh address set for consumers that must not silently use
+    /// only one address per adapter. Keep numeric IPv6 scopes intact.
+    pub(crate) fn fresh_addresses(&self, now: Instant) -> Result<Vec<String>, &'static str> {
+        let status = self.ip_configuration_status(now);
+        if status != "available" { return Err(status); }
+        let mut addresses: Vec<_> = self.values.values()
+            .flat_map(|config| config.addresses.iter().map(|address| address.address.clone())).collect();
+        addresses.sort();
+        addresses.dedup();
+        if addresses.is_empty() { return Err("no_addresses"); }
+        Ok(addresses)
+    }
 }
 
 fn collector_status(
@@ -296,6 +309,28 @@ pub fn collect() -> Result<HashMap<u64, IpConfiguration>, u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn fresh_address_set_preserves_all_addresses_and_scopes_but_rejects_stale_or_failed_data() {
+        let now = Instant::now();
+        let mut cache = ConfigCache::default();
+        assert_eq!(cache.fresh_addresses(now), Err("not_available"));
+        cache.begin_ip_refresh(now);
+        assert_eq!(cache.fresh_addresses(now), Err("pending"));
+        let addresses = ["192.0.2.1", "192.0.2.2", "fe80::1%12", "fe80::1%13", "192.0.2.1"];
+        let config = IpConfiguration {
+            source: "test".into(), sampled_at: 0,
+            addresses: addresses.iter().map(|address| IpAddress { address: address.to_string(), prefix_length: 24, family: "test".into() }).collect(),
+            dns_servers: vec![], gateways: vec![], dhcpv4_enabled: false,
+            dhcpv4_server: None, dhcpv6_server: None, ipv4_metric: 0, ipv6_metric: 0,
+        };
+        cache.complete_ip(Ok(HashMap::from([(1, config)])), now);
+        assert_eq!(cache.fresh_addresses(now).unwrap(), ["192.0.2.1", "192.0.2.2", "fe80::1%12", "fe80::1%13"]);
+        assert_eq!(cache.fresh_addresses(now + STALE_AFTER), Err("stale"));
+        cache.complete_ip(Err(1), now);
+        assert_eq!(cache.fresh_addresses(now), Err("query_failed"));
+        cache.complete_ip(Ok(HashMap::new()), now);
+        assert_eq!(cache.fresh_addresses(now), Err("no_addresses"));
+    }
     #[test]
     fn rejects_null_and_truncated_socket_buffers() {
         let b = Buffer::new(16);
