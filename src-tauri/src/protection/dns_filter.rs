@@ -336,7 +336,7 @@ fn validate_complete_layout(
 fn validate_ip(ip: IpAddr, kind: &str) -> Result<(), String> {
     let invalid = match ip {
         IpAddr::V4(ip) => ip.is_unspecified() || ip.is_multicast(),
-        IpAddr::V6(ip) => ip.is_unspecified() || ip.is_multicast() || ip.to_ipv4().is_some(),
+        IpAddr::V6(ip) => ip.is_unspecified() || ip.is_multicast() || ip.to_ipv4_mapped().is_some(),
     };
     if invalid {
         return Err(format!("{kind} {ip} is unspecified, multicast, or mapped"));

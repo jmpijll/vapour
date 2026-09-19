@@ -15,7 +15,7 @@
 
 ## Work and acceptance ledger
 
-- [ ] Integrate Firewall PR #1, dependency PR #2 and adapter PR #3 after independent checks; test the combined branch and installable/native preview.
+- [ ] Finish integration PR #3 and test the combined branch and installable/native preview. Firewall PR #1 and dependency PR #2 are already merged (2026-09-13).
 - [ ] Configuration collectors: independent bounded workers, declared buffer lengths, stale/hung reporting, live comparison with Windows. Files: network/ip_config.rs, routes.rs, adapter.rs, monitor.rs, types.rs.
 - [ ] Wi-Fi quality: runtime-supported privacy-friendly API, verified units and variable-tail ABI, disconnect/unsupported/invalid payload tests, live adapter test. File: network/wifi_quality.rs; wire cache/types only after review.
 - [ ] Driver/DHCP details: driver provider/version/date, optional duplex/negotiation properties with provenance, no inferred values. Slow/cache-only metadata; compare with native tools.

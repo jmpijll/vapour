@@ -271,6 +271,12 @@ enum Quiescence {
     Uncertain,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ControlState {
+    Certain,
+    Uncertain,
+}
+
 struct Running {
     child: ManagedChild,
     stdin: Option<File>,
@@ -282,7 +288,8 @@ struct Running {
     job: ChildJob,
     status: Option<DnsProcessStatus>,
     quiescence: Quiescence,
-    quiesce_writer: Option<JoinHandle<io::Result<()>>>,
+    control: ControlState,
+    pending_writer: Option<JoinHandle<io::Result<()>>>,
 }
 
 /// Owns at most one loopback DNS companion process.
@@ -327,6 +334,12 @@ impl DnsProcessManager {
             Some(running) => match running.child.try_wait() {
                 Ok(None) => {
                     return Err("DNS proxy is already running".to_owned());
+                }
+                Ok(Some(exit)) if running.is_transparent() => {
+                    running.control = ControlState::Uncertain;
+                    return Err(format!(
+                        "DNS proxy stopped unexpectedly ({exit}); explicit stop is required before restart"
+                    ));
                 }
                 Ok(Some(_)) => true,
                 Err(error) => {
@@ -375,7 +388,11 @@ impl DnsProcessManager {
             Ok(None) => Ok(slot.as_ref().and_then(|running| running.status.clone())),
             Ok(Some(exit)) => {
                 let message = format!("DNS proxy stopped unexpectedly ({})", exit);
-                if slot
+                if slot.as_ref().is_some_and(Running::is_transparent) {
+                    if let Some(running) = slot.as_mut() {
+                        running.control = ControlState::Uncertain;
+                    }
+                } else if slot
                     .as_ref()
                     .is_some_and(|running| running.quiescence == Quiescence::Active)
                 {
@@ -404,9 +421,10 @@ impl DnsProcessManager {
     /// Replace the active rule text and wait for the companion's bounded
     /// acknowledgement. Manager operations are serialized by the state lock.
     /// A structured `error` response is a rejected update and leaves the
-    /// existing process and status available. Malformed output, a timeout, or
-    /// process failure makes the state uncertain, so the child is terminated
-    /// and reaped before the error is returned.
+    /// existing process and status available. For transparent mode, malformed
+    /// output, a timeout, or process failure retains the child and reservations
+    /// in an uncertain state until explicit stop; legacy mode keeps its
+    /// terminating failure behavior.
     pub fn reload(&self, rules: String) -> Result<DnsProcessStatus, String> {
         let command = encode_reload_command(&rules)?;
         let mut slot = self
@@ -417,6 +435,7 @@ impl DnsProcessManager {
         let mut running = slot
             .take()
             .ok_or_else(|| "DNS proxy is not running".to_owned())?;
+        let transparent = running.is_transparent();
 
         match running.reload(command) {
             Ok(status) => {
@@ -428,7 +447,12 @@ impl DnsProcessManager {
                 Err(error)
             }
             Err(ReloadFailure::Uncertain(error)) => {
-                terminate_and_reap(&mut running);
+                if transparent {
+                    running.control = ControlState::Uncertain;
+                    *slot = Some(running);
+                } else {
+                    terminate_and_reap(&mut running);
+                }
                 Err(error)
             }
         }
@@ -436,7 +460,8 @@ impl DnsProcessManager {
 
     /// Add one exact reflected flow authorization to a running transparent
     /// companion.  A structured error leaves the child and its current status
-    /// available; malformed output, a timeout, or child failure terminates it.
+    /// available; malformed output, a timeout, or child failure retains the
+    /// transparent owner in an uncertain state until explicit stop.
     pub(crate) fn register_flow(&self, flow: TransparentFlowRegistration) -> Result<(), String> {
         self.flow_command("register", flow)
     }
@@ -460,6 +485,7 @@ impl DnsProcessManager {
         let mut running = slot
             .take()
             .ok_or_else(|| "DNS proxy is not running".to_owned())?;
+        let transparent = running.is_transparent();
 
         match running.flow_command(command, operation) {
             Ok(()) => {
@@ -471,7 +497,12 @@ impl DnsProcessManager {
                 Err(error)
             }
             Err(ReloadFailure::Uncertain(error)) => {
-                terminate_and_reap(&mut running);
+                if transparent {
+                    running.control = ControlState::Uncertain;
+                    *slot = Some(running);
+                } else {
+                    terminate_and_reap(&mut running);
+                }
                 Err(error)
             }
         }
@@ -486,6 +517,12 @@ impl DnsProcessManager {
             .lock()
             .map_err(|_| "DNS process state is poisoned")?;
         let running = slot.as_mut().ok_or("DNS proxy is not running")?;
+        if running.control == ControlState::Uncertain {
+            return Err(
+                "DNS companion control state is uncertain; stop interception before stopping the companion"
+                    .into(),
+            );
+        }
         match running.quiescence {
             Quiescence::Quiesced => return Ok(()),
             Quiescence::Uncertain => {
@@ -541,6 +578,9 @@ impl DnsProcessManager {
 }
 
 fn require_active(running: Option<&Running>) -> Result<(), String> {
+    if running.is_some_and(|running| running.control == ControlState::Uncertain) {
+        return Err("DNS companion control state is uncertain; stop before retrying".into());
+    }
     if running.is_some_and(|running| running.quiescence != Quiescence::Active) {
         return Err("DNS companion is quiescing or quiesced".into());
     }
@@ -557,6 +597,12 @@ impl Drop for DnsProcessManager {
 }
 
 impl Running {
+    fn is_transparent(&self) -> bool {
+        self.status
+            .as_ref()
+            .is_some_and(|status| !status.slots.is_empty())
+    }
+
     fn launch(appdata_path: &Path, config: DnsProcessConfig) -> Result<Self, String> {
         validate_config(&config)?;
         let start_command = encode_start_command(&config)?;
@@ -640,7 +686,8 @@ impl Running {
                 job,
                 status: None,
                 quiescence: Quiescence::Active,
-                quiesce_writer: None,
+                control: ControlState::Certain,
+                pending_writer: None,
             };
 
             let stdin = running
@@ -729,28 +776,34 @@ impl Running {
     }
 
     fn reload(&mut self, command: Vec<u8>) -> Result<DnsProcessStatus, ReloadFailure> {
-        let deadline = Instant::now() + READY_TIMEOUT;
-        let stdin = self.stdin.take().ok_or_else(|| {
-            ReloadFailure::Uncertain("DNS proxy stdin pipe is unavailable".to_owned())
-        })?;
-        self.stdin = Some(
-            write_pipe_bounded(
-                stdin,
-                command,
-                deadline,
-                &mut self.child,
-                &self.job,
-                "DNS proxy reload command write",
-            )
-            .map_err(ReloadFailure::Uncertain)?,
-        );
+        let timeout = READY_TIMEOUT;
+        let deadline = Instant::now() + timeout;
+        if self.is_transparent() {
+            self.write_retained_control(command, deadline, "DNS proxy reload command write")?;
+        } else {
+            let stdin = self.stdin.take().ok_or_else(|| {
+                ReloadFailure::Uncertain("DNS proxy stdin pipe is unavailable".to_owned())
+            })?;
+            self.stdin = Some(
+                write_pipe_bounded(
+                    stdin,
+                    command,
+                    deadline,
+                    &mut self.child,
+                    &self.job,
+                    "DNS proxy reload command write",
+                )
+                .map_err(ReloadFailure::Uncertain)?,
+            );
+        }
 
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return Err(ReloadFailure::Uncertain(
-                    "DNS proxy reload did not respond within 10 seconds".to_owned(),
-                ));
+                return Err(ReloadFailure::Uncertain(format!(
+                    "DNS proxy reload did not respond within {} seconds",
+                    timeout.as_secs()
+                )));
             }
 
             match self
@@ -827,21 +880,24 @@ impl Running {
 
     fn flow_command(&mut self, command: Vec<u8>, operation: &str) -> Result<(), ReloadFailure> {
         let deadline = Instant::now() + FLOW_TIMEOUT;
-        let stdin = self
-            .stdin
-            .take()
-            .ok_or_else(|| ReloadFailure::Uncertain("DNS proxy stdin is unavailable".to_owned()))?;
-        self.stdin = Some(
-            write_pipe_bounded(
-                stdin,
-                command,
-                deadline,
-                &mut self.child,
-                &self.job,
-                "DNS proxy flow command write",
-            )
-            .map_err(ReloadFailure::Uncertain)?,
-        );
+        if self.is_transparent() {
+            self.write_retained_control(command, deadline, "DNS proxy flow command write")?;
+        } else {
+            let stdin = self.stdin.take().ok_or_else(|| {
+                ReloadFailure::Uncertain("DNS proxy stdin is unavailable".to_owned())
+            })?;
+            self.stdin = Some(
+                write_pipe_bounded(
+                    stdin,
+                    command,
+                    deadline,
+                    &mut self.child,
+                    &self.job,
+                    "DNS proxy flow command write",
+                )
+                .map_err(ReloadFailure::Uncertain)?,
+            );
+        }
 
         let expected = if operation == "register" {
             "registered"
@@ -852,41 +908,64 @@ impl Running {
     }
 
     fn write_quiesce(&mut self, deadline: Instant) -> Result<(), ReloadFailure> {
+        self.write_retained_control(
+            b"{\"op\":\"quiesce\"}\n".to_vec(),
+            deadline,
+            "DNS quiesce command write",
+        )
+    }
+
+    fn write_retained_control(
+        &mut self,
+        payload: Vec<u8>,
+        deadline: Instant,
+        operation: &str,
+    ) -> Result<(), ReloadFailure> {
+        if self.pending_writer.is_some() {
+            return Err(ReloadFailure::Uncertain(
+                "DNS proxy control writer is already pending".to_owned(),
+            ));
+        }
         let mut writer = self
             .stdin
             .as_ref()
             .ok_or_else(|| ReloadFailure::Uncertain("DNS proxy stdin is unavailable".into()))?
             .try_clone()
             .map_err(|error| {
-                ReloadFailure::Uncertain(format!("cannot retain DNS command pipe: {error}"))
+                ReloadFailure::Uncertain(format!("cannot retain {operation} pipe: {error}"))
             })?;
         let (sender, receiver) = mpsc::sync_channel(1);
         // The original stdin stays in Running even if this worker fails or
         // times out. Closing only the clone cannot send EOF to the companion.
         let worker = thread::Builder::new()
-            .name("vapour-dns-quiesce".into())
+            .name("vapour-dns-control".into())
             .spawn(move || {
-                let result = writer
-                    .write_all(b"{\"op\":\"quiesce\"}\n")
-                    .and_then(|()| writer.flush());
+                let result = writer.write_all(&payload).and_then(|()| writer.flush());
                 drop(writer);
                 let _ = sender.send(result.map_err(|error| error.to_string()));
                 Ok(())
             })
             .map_err(|error| {
-                ReloadFailure::Uncertain(format!("cannot start DNS quiesce writer: {error}"))
+                ReloadFailure::Uncertain(format!("cannot start {operation} worker: {error}"))
             })?;
-        self.quiesce_writer = Some(worker);
+        self.pending_writer = Some(worker);
         match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
             Ok(result) => {
-                join_worker_bounded(self.quiesce_writer.take().expect("quiesce writer present"));
+                join_worker_bounded(self.pending_writer.take().expect("control writer present"));
                 result.map_err(|error| {
-                    ReloadFailure::Uncertain(format!("DNS quiesce write failed: {error}"))
+                    ReloadFailure::Uncertain(format!("{operation} failed: {error}"))
                 })
             }
-            Err(error) => Err(ReloadFailure::Uncertain(format!(
-                "DNS quiesce write is uncertain: {error}"
+            Err(RecvTimeoutError::Timeout) => Err(ReloadFailure::Uncertain(format!(
+                "{operation} is uncertain: writer deadline expired"
             ))),
+            Err(RecvTimeoutError::Disconnected) => {
+                let worker = self.pending_writer.take().expect("control writer present");
+                join_worker_bounded(worker);
+                Err(ReloadFailure::Uncertain(format!(
+                    "{operation} is uncertain: writer disconnected"
+                )))
+            }
         }
     }
 
@@ -901,7 +980,7 @@ impl Running {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err(ReloadFailure::Uncertain(format!(
-                    "DNS proxy {operation} flow command did not respond within {} seconds",
+                    "DNS proxy {operation} command did not respond within {} seconds",
                     timeout.as_secs()
                 )));
             }
@@ -1957,7 +2036,10 @@ fn validate_updated_status(status: &WireStatus) -> Result<(), String> {
 fn stop_running(mut running: Running, send_stop: bool) -> Result<(), String> {
     // The owner has now closed interception. Never race a timed-out writer
     // with a second command on the same byte stream.
-    if running.quiesce_writer.is_some() {
+    if running.pending_writer.is_some()
+        || running.control == ControlState::Uncertain
+        || running.quiescence == Quiescence::Uncertain
+    {
         terminate_and_reap(&mut running);
         return Ok(());
     }
@@ -2307,7 +2389,7 @@ impl Drop for Running {
     fn drop(&mut self) {
         force_terminate(self);
         cleanup_reader(self, false);
-        if let Some(worker) = self.quiesce_writer.take() {
+        if let Some(worker) = self.pending_writer.take() {
             join_worker_bounded(worker);
         }
     }
@@ -2969,6 +3051,97 @@ mod tests {
     }
 
     #[cfg(windows)]
+    fn exercise_transparent_uncertain_control(operation: &str, malformed: bool) {
+        let path = test_directory(&format!("transparent-{operation}-uncertain"));
+        let manager = DnsProcessManager::new(path.clone());
+        let config = TransparentDnsConfig {
+            listen_addresses: vec!["127.0.0.1".into()],
+            listen_port: 0,
+            rules: String::new(),
+        };
+        let status = manager
+            .start_transparent(config.clone())
+            .expect("real transparent companion should start unelevated");
+        let client = UdpSocket::bind("127.0.0.1:0").expect("bind transparent local client");
+        client
+            .connect(&status.udp_addr)
+            .expect("connect transparent local client");
+        let flow = TransparentFlowRegistration {
+            protocol: "udp".into(),
+            peer: client.local_addr().unwrap().to_string(),
+            local: status.udp_addr.clone(),
+            resolver: "127.0.0.1:53".into(),
+            slot: status.slots[0].id,
+            lifetime_ms: 120_000,
+        };
+
+        let (sender, injected) = mpsc::sync_channel(1);
+        if malformed {
+            let line = match operation {
+                "register" => br#"{"status":"registered","rules_count":1}"#.to_vec(),
+                "reload" => br#"{"status":"updated","tcp_addr":"127.0.0.1:1"}"#.to_vec(),
+                _ => panic!("unsupported transparent control operation {operation}"),
+            };
+            sender
+                .send(ReaderEvent::Line(line))
+                .expect("inject malformed acknowledgement");
+        }
+        let actual = {
+            let mut state = manager.running.lock().unwrap();
+            std::mem::replace(&mut state.as_mut().unwrap().events, injected)
+        };
+
+        let issue = |manager: &DnsProcessManager| match operation {
+            "register" => manager.register_flow(flow.clone()).map(|()| ()),
+            "reload" => manager
+                .reload("||uncertain.example.test^".to_owned())
+                .map(|_| ()),
+            _ => panic!("unsupported transparent control operation {operation}"),
+        };
+        assert!(
+            issue(&manager).is_err(),
+            "first {operation} must be uncertain"
+        );
+        let retry = issue(&manager).expect_err("uncertain command must not be retried");
+        assert!(
+            retry.contains("uncertain"),
+            "retry error must expose uncertain ownership state: {retry}"
+        );
+        assert!(
+            manager.start_transparent(config).is_err(),
+            "uncertain transparent owner must not be replaced"
+        );
+        assert!(manager.status().unwrap().is_some());
+        assert_ports_reserved(&status);
+
+        drop(sender);
+        manager
+            .stop()
+            .expect("explicit stop must clean up uncertain transparent owner");
+        assert_ports_released(&status);
+        drop(actual);
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "real unelevated companion with local sockets only; no driver or DNS settings"]
+    fn transparent_register_malformed_or_timeout_retains_owner_without_retry() {
+        for malformed in [true, false] {
+            exercise_transparent_uncertain_control("register", malformed);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "real unelevated companion with local sockets only; no driver or DNS settings"]
+    fn transparent_reload_malformed_or_timeout_retains_owner_without_retry() {
+        for malformed in [true, false] {
+            exercise_transparent_uncertain_control("reload", malformed);
+        }
+    }
+
+    #[cfg(windows)]
     #[test]
     #[ignore = "real unelevated helper and local sockets only; no interception or DNS settings"]
     fn quiesce_retains_ports_until_explicit_stop() {
@@ -3097,7 +3270,7 @@ mod tests {
         {
             let mut state = manager.running.lock().unwrap();
             let running = state.as_mut().unwrap();
-            assert!(running.quiesce_writer.is_none());
+            assert!(running.pending_writer.is_none());
             // Model death after an uncertain control outcome. The OS releases
             // sockets on death, but health polling must not replace the owner.
             running.quiescence = Quiescence::Uncertain;
@@ -3117,7 +3290,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     #[ignore = "real unelevated helper and anonymous pipes only; no driver or system settings"]
-    fn stop_with_pending_quiesce_writer_does_not_send_a_second_command() {
+    fn stop_with_pending_control_writer_does_not_send_a_second_command() {
         let path = test_directory("quiesce-pending-writer");
         let manager = DnsProcessManager::new(path.clone());
         manager
@@ -3195,7 +3368,7 @@ mod tests {
             let mut state = manager.running.lock().unwrap();
             let running = state.as_mut().expect("running transparent companion");
             running.quiescence = Quiescence::Uncertain;
-            running.quiesce_writer = Some(writer_worker);
+            running.pending_writer = Some(writer_worker);
         }
         drain_requested.store(true, Ordering::Release);
         let stop_started = Instant::now();
@@ -3575,7 +3748,8 @@ mod tests {
             job,
             status: None,
             quiescence: Quiescence::Active,
-            quiesce_writer: None,
+            control: ControlState::Certain,
+            pending_writer: None,
         };
         let command = encode_start_command(&config(upstream.local_addr().unwrap()))
             .expect("encode demoted start command");

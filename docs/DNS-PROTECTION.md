@@ -109,8 +109,8 @@ The next implementation follows the
 intercept conventional UDP/TCP port 53 traffic with a separate active WinDivert
 handle and retain the original resolver destination selected by Windows. The
 companion now has an internal command mode for exact per-flow routing and owned
-upstream sockets. The Rust controller still needs to connect that mode to packet
-interception before it can replace the fixed-upstream test configuration. Adapter DNS
+upstream sockets. The internal Rust session connects that mode to packet
+interception; native verification is required before enabling it in the app. Adapter DNS
 settings remain unchanged in this design. The existing configuration journal
 and watchdog are groundwork for the alternative adapter-rewrite approach; they
 must not be enabled alongside transparent interception.
@@ -124,7 +124,7 @@ Local tests use synthetic endpoints and do not change adapter DNS settings.
 
 The Windows filter builder now checks complete companion bindings and emits
 disjoint filters covering at most four local addresses each. Sixteen addresses
-require four filter groups and, once integrated, four handles: the real WinDivert compiler rejects the
+require four filter groups and four handles: the real WinDivert compiler rejects the
 larger single expression. Tests use the shipped DLL's compiler and evaluator
 without opening a driver handle. They verify IPv4/IPv6 UDP/TCP matching,
 protocol-specific source-port exclusions, different local addresses using the
@@ -134,8 +134,10 @@ listener and reserved socket reported to the Rust controller.
 
 The Rust process manager now starts that mode, verifies all listener and slot
 bindings, and serializes bounded register/release commands alongside reload and
-stop. Unexpected acknowledgements or stream failure terminate the child;
-explicit command rejection preserves it. An unelevated integration test starts
+stop. In transparent mode, unexpected acknowledgements or stream failure now
+retain the child and owned ports until explicit cleanup; subsequent mutations
+are rejected. Legacy fixed-upstream mode retains its terminating error behavior.
+An unelevated integration test starts
 the real embedded companion, builds filters from its readiness response,
 registers a real local UDP client, receives a blocked response, releases that
 flow, verifies subsequent queries receive no response, and stops the process.
@@ -147,14 +149,35 @@ The Rust owner also retains the process on missing or malformed quiesce replies;
 registration, reload and replacement remain disabled until explicit cleanup.
 Real unelevated integration tests verify port retention, silent UDP admission,
 active TCP closure, delayed/malformed acknowledgements and child-exit handling.
-This does not establish kernel packet silence: the runtime still needs to drain
-and close interception handles before it tells the companion to release ports.
+This does not establish kernel packet silence: the runtime's drain/close ordering
+must also be verified with real interception handles before enabling protection.
 
-These checks do not establish end-to-end protection. Remaining work includes
-connecting the bounded packet/flow reflection to these listeners, installing
-the exact owned-port exclusions, session rollover, helper/driver failure recovery,
-driver shutdown ordered after companion quiescence and before socket release,
-restart, periodic updates and the UI switch. Native tests must verify that
+The packet router now connects the flow registry to the companion's real
+registration protocol. It selects an owned slot by local address, resolver and
+transport, waits for acknowledgement before returning the first reflected
+packet, and restores only registered reverse tuples. Unknown proxy replies are
+dropped. Numeric IPv6 scopes come from the captured interface. Router unit tests
+cover both transports/families, retry reuse, failed authorization, reserved-port
+exclusions, drain behavior and generation exhaustion. Separate unelevated IPv4
+and IPv6 UDP tests send the reflected DNS payload through actual companion
+listeners and restore the returned NXDOMAIN packet. They also caught and fixed
+an overly broad address check that incorrectly rejected IPv6 loopback `::1`.
+These tests do not exercise actual driver injection.
+
+The internal Windows session now connects the router, companion and grouped
+interception handles. Its supervisor freezes admission, quiesces the companion,
+shuts down receive on every handle, waits for workers to drain and exit, closes
+handles, and only then releases companion sockets. A bounded stop timeout retains
+ownership for cleanup rather than reporting success. A real unelevated helper test
+with a deliberately blocked worker verifies that UDP/TCP reservations remain held
+until that worker exits and that its terminal failure remains observable.
+An indefinitely stuck native worker still retains the helper; this is incomplete
+cleanup, not a successful stop.
+
+These checks do not establish end-to-end protection. The driver-backed session
+tests are prepared in [DNS-NATIVE-TESTS.md](DNS-NATIVE-TESTS.md) but have not run.
+Remaining work includes session rollover, topology changes, native failure
+recovery verification, restart, periodic updates and the UI switch. Native tests must verify that
 adapter settings stay unchanged and that cleanup restores ordinary packet flow.
 VPN, NRPT and per-application routing still need explicit verification: retaining
 the destination alone does not prove equivalent process or compartment policy.

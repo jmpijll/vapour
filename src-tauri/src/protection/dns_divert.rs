@@ -488,6 +488,9 @@ mod tests {
             .compile_filter(&validate_filter("outbound and udp.DstPort == 53").unwrap())
             .is_ok());
         assert!(api
+            .compile_filter(&validate_filter("outbound and ipv6.SrcAddr == ::1 and udp.DstPort == 53").unwrap())
+            .is_ok());
+        assert!(api
             .compile_filter(&validate_filter("not_a_windivert_field == 1").unwrap())
             .is_err());
         drop(api);

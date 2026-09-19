@@ -40,15 +40,23 @@ and wait for handlers while retaining reserved upstream sockets. Only after
 the driver readers drain and their handles close may those reservations be
 released. The companion barrier and Rust control protocol are implemented and
 tested with real local sockets, including timeout/malformed replies and child
-exit. Driver drain/close ordering is not implemented yet. Native tests must still cover
+exit. The internal session now implements driver drain/close ordering, with an
+unelevated blocked-worker test proving socket retention until worker exit.
+Actual driver behavior remains unverified. Native tests must still cover
 late TCP control packets, retransmission and process failure; a user-mode
 handler barrier alone does not prove the network stack has stopped sending.
 
-Before wiring the active controller, extend reservation-preserving uncertainty
-handling to transparent register/release/reload writes and replies as well.
-Those older command paths still terminate the companion on uncertainty; that
-would release excluded ports before an installed driver handle is closed. The
-new quiesce path alone is not sufficient to make those paths safe for interception.
+Transparent register/release/reload now use reservation-preserving writes and
+retain the owner on uncertain replies. Register and reload malformed/timeout
+tests exercise the real companion; further commands/replacement are refused
+until explicit stop. Reload retains its ten-second parser allowance.
+
+The packet router now selects fixed resolver/transport slots and authorizes
+each flow before returning its reflected packet. A failed acknowledgement
+freezes that generation. Reverse packets require a confirmed registration.
+Seven router unit tests and two real companion UDP round trips (IPv4/IPv6)
+pass without opening a driver. Slot/flow exhaustion requests rollover; the
+long-running generation controller and topology replacement remain outstanding.
 
 1. Implement a pure IPv4/IPv6 packet reflection and mapping module. Retain the
    original local address, resolver address, interface, transport and ports.
