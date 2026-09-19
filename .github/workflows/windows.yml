@@ -47,3 +47,12 @@ jobs:
         run: go vet ./...
       - name: Standalone build
         run: pnpm build:native
+      - name: Package Windows review build
+        run: ./scripts/package-review.ps1 -Executable ./src-tauri/target/release/vapour.exe -Destination "${{ runner.temp }}/vapour-review"
+      - name: Upload Windows review build
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: Vapour-windows-x64-${{ github.sha }}
+          path: ${{ runner.temp }}/vapour-review/
+          if-no-files-found: error
+          retention-days: 14

@@ -44,6 +44,8 @@ All screenshots below use built-in **sample data**, not personal traffic. Browse
 
 This is an early, source-first alpha. There is no signed installer or stable binary release yet. Windows x64 is the current native target; Linux and macOS are planned.
 
+For a test build, open a successful [Windows checks run](https://github.com/jmpijll/vapour/actions/workflows/windows.yml) and download its **Vapour-windows-x64** artifact (GitHub sign-in required). Extract it and run `Vapour.exe`; the archive includes a review checklist, revision/hashes and the matching source. These unsigned builds are retained for 14 days and may include unfinished roadmap work. WebView2 is required; build tools are only needed when compiling from source.
+
 ### Requirements
 
 - Windows 10/11 x64 with WebView2 and the Visual Studio C++ build tools / Windows SDK.
