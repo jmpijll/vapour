@@ -23,8 +23,24 @@ continuously.
 The separate active driver wrapper now owns receive, reinjection, checksum and
 shutdown APIs. Its unit tests use a fake API. An ignored native probe covers
 isolated loopback TCP/UDP over both families and traffic after handle closure;
-that probe has not been run. Companion integration and real packet reflection
-remain outstanding. None of this groundwork enables system interception.
+that probe has not been run. The Rust process manager now starts the transparent
+companion and registers/releases exact flow tuples. A real unelevated companion
+test covers blocked UDP delivery and post-release silence. Filter construction
+is checked with the real WinDivert compiler/evaluator without opening a handle.
+Real packet reflection remains outstanding. None of this groundwork enables
+system interception.
+
+Ruling: split filter coverage into disjoint groups of at most four addresses.
+The real DLL rejected the complete sixteen-address expression as too long;
+native evaluator tests prove complete, non-overlapping coverage across four
+groups. The controller must own all returned handles, not just the first.
+
+Ruling: add a quiesce phase before normal stop/rollover. It must stop new work
+and wait for handlers while retaining reserved upstream sockets. Only after
+the driver readers drain and their handles close may those reservations be
+released. This ordering is not implemented yet. Native tests must still cover
+late TCP control packets, retransmission and process failure; a user-mode
+handler barrier alone does not prove the network stack has stopped sending.
 
 1. Implement a pure IPv4/IPv6 packet reflection and mapping module. Retain the
    original local address, resolver address, interface, transport and ports.

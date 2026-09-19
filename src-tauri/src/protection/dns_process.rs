@@ -51,6 +51,7 @@ const MAX_RULE_TEXT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_COMMAND_BYTES: usize = 2 * MAX_RULE_TEXT_BYTES + 64 * 1024;
 const MAX_STATUS_LINE_BYTES: usize = 64 * 1024;
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
+const FLOW_TIMEOUT: Duration = Duration::from_secs(2);
 const STOP_TIMEOUT: Duration = Duration::from_secs(3);
 const READER_CLEANUP_TIMEOUT: Duration = Duration::from_millis(250);
 const READER_POLL_INTERVAL: Duration = Duration::from_millis(5);
@@ -78,6 +79,36 @@ pub struct DnsProcessConfig {
     pub rules: String,
 }
 
+/// Configuration for the transparent companion mode.  The companion binds
+/// the requested local addresses itself; each address receives eight
+/// controller-owned UDP and TCP upstream slots.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct TransparentDnsConfig {
+    pub(crate) listen_addresses: Vec<String>,
+    pub(crate) listen_port: u16,
+    pub(crate) rules: String,
+}
+
+/// A reserved source endpoint owned by one transparent listener address.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct UpstreamSlot {
+    pub(crate) id: usize,
+    pub(crate) udp_addr: String,
+    pub(crate) tcp_addr: String,
+}
+
+/// One exact reflected flow authorization to install in the companion.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct TransparentFlowRegistration {
+    pub(crate) protocol: String,
+    pub(crate) peer: String,
+    pub(crate) local: String,
+    pub(crate) resolver: String,
+    pub(crate) slot: usize,
+    pub(crate) lifetime_ms: u64,
+}
+
 /// The addresses reported by the companion after both loopback listeners are
 /// ready. The field names intentionally match the companion status JSON.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -87,6 +118,7 @@ pub struct DnsProcessStatus {
     pub udp_addrs: Vec<String>,
     pub tcp_addrs: Vec<String>,
     pub rules_count: u64,
+    pub(crate) slots: Vec<UpstreamSlot>,
 }
 
 #[derive(Serialize)]
@@ -99,6 +131,26 @@ struct StartCommand<'a> {
 struct ReloadCommand<'a> {
     op: &'static str,
     rules: &'a str,
+}
+
+#[derive(Serialize)]
+struct TransparentStartCommand<'a> {
+    op: &'static str,
+    config: TransparentStartConfig<'a>,
+}
+
+#[derive(Serialize)]
+struct TransparentStartConfig<'a> {
+    transparent: bool,
+    listen_addresses: &'a [String],
+    listen_port: u16,
+    rules: &'a str,
+}
+
+#[derive(Serialize)]
+struct FlowCommand<'a> {
+    op: &'static str,
+    flow: &'a TransparentFlowRegistration,
 }
 
 #[derive(Deserialize)]
@@ -117,6 +169,8 @@ struct WireStatus {
     tcp_addrs: Option<Vec<String>>,
     #[serde(default)]
     rules_count: Option<u64>,
+    #[serde(default)]
+    slots: Option<Vec<UpstreamSlot>>,
 }
 
 enum ReaderEvent {
@@ -132,6 +186,33 @@ enum ReloadFailure {
     /// The response stream or child state is no longer trustworthy. The
     /// manager must remove and contain the process before returning.
     Uncertain(String),
+}
+
+enum StartSpec {
+    Legacy(DnsProcessConfig),
+    Transparent(TransparentDnsConfig),
+}
+
+impl StartSpec {
+    fn launch(&self, appdata_path: &Path) -> Result<Running, String> {
+        match self {
+            Self::Legacy(config) => Running::launch(appdata_path, config.clone()),
+            Self::Transparent(config) => Running::launch_transparent(appdata_path, config),
+        }
+    }
+
+    fn validate_ready(&self, status: &DnsProcessStatus) -> Result<(), String> {
+        match self {
+            Self::Legacy(config) => validate_listeners(
+                status,
+                &config.listen_address,
+                config.listen_port,
+                config.dual_stack,
+                &config.upstream,
+            ),
+            Self::Transparent(config) => validate_transparent_listeners(status, config),
+        }
+    }
 }
 
 struct EngineImage {
@@ -214,6 +295,18 @@ impl DnsProcessManager {
 
     /// Extract, verify, start, and wait for both companion listeners.
     pub fn start(&self, config: DnsProcessConfig) -> Result<DnsProcessStatus, String> {
+        self.start_with(StartSpec::Legacy(config))
+    }
+
+    /// Extract, verify, start, and wait for the transparent companion.
+    pub(crate) fn start_transparent(
+        &self,
+        config: TransparentDnsConfig,
+    ) -> Result<DnsProcessStatus, String> {
+        self.start_with(StartSpec::Transparent(config))
+    }
+
+    fn start_with(&self, spec: StartSpec) -> Result<DnsProcessStatus, String> {
         let mut slot = self
             .running
             .lock()
@@ -240,17 +333,10 @@ impl DnsProcessManager {
             return Err("DNS proxy is already running".to_owned());
         }
 
-        let expected = (
-            config.listen_address.clone(),
-            config.listen_port,
-            config.dual_stack,
-            config.upstream.clone(),
-        );
-        let mut running = Running::launch(&self.appdata_path, config)?;
-        let ready = running.wait_ready().and_then(|status| {
-            validate_listeners(&status, &expected.0, expected.1, expected.2, &expected.3)?;
-            Ok(status)
-        });
+        let mut running = spec.launch(&self.appdata_path)?;
+        let ready = running
+            .wait_ready()
+            .and_then(|status| spec.validate_ready(&status).map(|()| status));
         let status = match ready {
             Ok(status) => status,
             Err(error) => {
@@ -331,6 +417,48 @@ impl DnsProcessManager {
         }
     }
 
+    /// Add one exact reflected flow authorization to a running transparent
+    /// companion.  A structured error leaves the child and its current status
+    /// available; malformed output, a timeout, or child failure terminates it.
+    pub(crate) fn register_flow(&self, flow: TransparentFlowRegistration) -> Result<(), String> {
+        self.flow_command("register", flow)
+    }
+
+    /// Permanently release one exact reflected flow authorization.
+    pub(crate) fn release_flow(&self, flow: TransparentFlowRegistration) -> Result<(), String> {
+        self.flow_command("release", flow)
+    }
+
+    fn flow_command(
+        &self,
+        operation: &'static str,
+        flow: TransparentFlowRegistration,
+    ) -> Result<(), String> {
+        let command = encode_flow_command(operation, &flow)?;
+        let mut slot = self
+            .running
+            .lock()
+            .map_err(|_| "DNS process state is poisoned".to_owned())?;
+        let mut running = slot
+            .take()
+            .ok_or_else(|| "DNS proxy is not running".to_owned())?;
+
+        match running.flow_command(command, operation) {
+            Ok(()) => {
+                *slot = Some(running);
+                Ok(())
+            }
+            Err(ReloadFailure::Rejected(error)) => {
+                *slot = Some(running);
+                Err(error)
+            }
+            Err(ReloadFailure::Uncertain(error)) => {
+                terminate_and_reap(&mut running);
+                Err(error)
+            }
+        }
+    }
+
     /// Parse a rule list in a separate ephemeral-port companion process. This
     /// is intended for cache validation and never touches this manager's
     /// active child or status.
@@ -368,6 +496,20 @@ impl Running {
         validate_config(&config)?;
         let start_command = encode_start_command(&config)?;
 
+        Self::launch_command(appdata_path, start_command)
+    }
+
+    fn launch_transparent(
+        appdata_path: &Path,
+        config: &TransparentDnsConfig,
+    ) -> Result<Self, String> {
+        validate_transparent_config(config)?;
+        let start_command = encode_transparent_start_command(config)?;
+
+        Self::launch_command(appdata_path, start_command)
+    }
+
+    fn launch_command(appdata_path: &Path, start_command: Vec<u8>) -> Result<Self, String> {
         #[cfg(not(windows))]
         {
             let _ = (appdata_path, start_command);
@@ -476,14 +618,17 @@ impl Running {
             {
                 Ok(ReaderEvent::Line(line)) => match parse_wire_status(&line) {
                     Ok(status) if status.status == "ready" => {
+                        validate_ready_status(&status)?;
                         let status = ready_status(status)?;
                         self.status = Some(status.clone());
                         return Ok(status);
                     }
                     Ok(status) if status.status == "error" => {
+                        validate_error_status(&status, "startup")?;
                         return Err(wire_error(&status));
                     }
                     Ok(status) if status.status == "stopped" => {
+                        validate_empty_status(&status, "stopped")?;
                         return Err("DNS proxy stopped before becoming ready".to_owned());
                     }
                     Ok(status) => {
@@ -549,6 +694,7 @@ impl Running {
                     let status = parse_wire_status(&line).map_err(ReloadFailure::Uncertain)?;
                     match status.status.as_str() {
                         "updated" => {
+                            validate_updated_status(&status).map_err(ReloadFailure::Uncertain)?;
                             let mut current = self.status.clone().ok_or_else(|| {
                                 ReloadFailure::Uncertain(
                                     "DNS proxy reload succeeded before a ready status".to_owned(),
@@ -559,12 +705,16 @@ impl Running {
                             return Ok(current);
                         }
                         "error" => {
+                            validate_error_status(&status, "reload")
+                                .map_err(ReloadFailure::Uncertain)?;
                             return Err(ReloadFailure::Rejected(format!(
                                 "DNS proxy rejected rule reload: {}",
                                 wire_error(&status)
                             )));
                         }
                         "stopped" => {
+                            validate_empty_status(&status, "stopped")
+                                .map_err(ReloadFailure::Uncertain)?;
                             return Err(ReloadFailure::Uncertain(
                                 "DNS proxy stopped while reloading rules".to_owned(),
                             ));
@@ -607,6 +757,104 @@ impl Running {
             }
         }
     }
+
+    fn flow_command(&mut self, command: Vec<u8>, operation: &str) -> Result<(), ReloadFailure> {
+        let deadline = Instant::now() + FLOW_TIMEOUT;
+        let stdin = self
+            .stdin
+            .take()
+            .ok_or_else(|| ReloadFailure::Uncertain("DNS proxy stdin is unavailable".to_owned()))?;
+        self.stdin = Some(
+            write_pipe_bounded(
+                stdin,
+                command,
+                deadline,
+                &mut self.child,
+                &self.job,
+                "DNS proxy flow command write",
+            )
+            .map_err(ReloadFailure::Uncertain)?,
+        );
+
+        let expected = if operation == "register" {
+            "registered"
+        } else {
+            "released"
+        };
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(ReloadFailure::Uncertain(format!(
+                    "DNS proxy {operation} flow command did not respond within {} seconds",
+                    FLOW_TIMEOUT.as_secs()
+                )));
+            }
+
+            match self
+                .events
+                .recv_timeout(remaining.min(Duration::from_millis(100)))
+            {
+                Ok(ReaderEvent::Line(line)) => {
+                    let status = parse_wire_status(&line).map_err(ReloadFailure::Uncertain)?;
+                    match status.status.as_str() {
+                        value if value == expected => {
+                            validate_empty_status(&status, operation)
+                                .map_err(ReloadFailure::Uncertain)?;
+                            return Ok(());
+                        }
+                        "error" => {
+                            validate_error_status(&status, operation)
+                                .map_err(ReloadFailure::Uncertain)?;
+                            return Err(ReloadFailure::Rejected(format!(
+                                "DNS proxy rejected {operation} flow: {}",
+                                wire_error(&status)
+                            )));
+                        }
+                        "stopped" => {
+                            validate_empty_status(&status, "stopped")
+                                .map_err(ReloadFailure::Uncertain)?;
+                            return Err(ReloadFailure::Uncertain(format!(
+                                "DNS proxy stopped while processing {operation} flow"
+                            )));
+                        }
+                        other => {
+                            return Err(ReloadFailure::Uncertain(format!(
+                                "DNS proxy reported unsupported {operation} flow status {other:?}"
+                            )));
+                        }
+                    }
+                }
+                Ok(ReaderEvent::Error(error)) => {
+                    return Err(ReloadFailure::Uncertain(format!(
+                        "DNS proxy output failed during {operation} flow: {error}"
+                    )));
+                }
+                Ok(ReaderEvent::Eof) => {
+                    return Err(ReloadFailure::Uncertain(format!(
+                        "DNS proxy output closed during {operation} flow"
+                    )));
+                }
+                Err(RecvTimeoutError::Timeout) => match self.child.try_wait() {
+                    Ok(None) => continue,
+                    Ok(Some(exit)) => {
+                        return Err(ReloadFailure::Uncertain(format!(
+                            "DNS proxy exited during {operation} flow ({exit})"
+                        )));
+                    }
+                    Err(error) => {
+                        return Err(ReloadFailure::Uncertain(format!(
+                            "cannot inspect DNS proxy during {operation} flow: {error}"
+                        )));
+                    }
+                },
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(ReloadFailure::Uncertain(format!(
+                        "DNS proxy output channel disconnected during {operation} flow"
+                    )));
+                }
+            }
+        }
+    }
 }
 
 fn validate_config(config: &DnsProcessConfig) -> Result<(), String> {
@@ -641,6 +889,114 @@ fn validate_config(config: &DnsProcessConfig) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_transparent_config(config: &TransparentDnsConfig) -> Result<(), String> {
+    if config.listen_addresses.is_empty() || config.listen_addresses.len() > 16 {
+        return Err("transparent DNS requires 1..16 listen addresses".to_owned());
+    }
+    if config.listen_port == 53 {
+        return Err("transparent DNS listen_port must not be 53".to_owned());
+    }
+    let mut seen = Vec::with_capacity(config.listen_addresses.len());
+    for address in &config.listen_addresses {
+        let parsed = parse_scoped_ip(address)?;
+        if parsed.ip.is_unspecified() || parsed.ip.is_multicast() {
+            return Err(format!(
+                "transparent listen address {address:?} is not unicast"
+            ));
+        }
+        if parsed.ip.is_ipv4() && parsed.zone.is_some() {
+            return Err(format!(
+                "transparent IPv4 address {address:?} cannot have a zone"
+            ));
+        }
+        if is_ipv6_link_local(parsed.ip) && parsed.zone.is_none() {
+            return Err(format!(
+                "transparent link-local address {address:?} requires a zone"
+            ));
+        }
+        if parsed.ip.is_ipv6() && !is_ipv6_link_local(parsed.ip) && parsed.zone.is_some() {
+            return Err(format!(
+                "transparent zone is only valid for link-local IPv6 address {address:?}"
+            ));
+        }
+        let canonical = parsed.canonical_text();
+        if seen.iter().any(|value| value == &canonical) {
+            return Err(format!("duplicate transparent listen address {address:?}"));
+        }
+        seen.push(canonical);
+    }
+    if config.rules.as_bytes().len() > MAX_RULE_TEXT_BYTES {
+        return Err(format!(
+            "rules exceed the {} byte limit",
+            MAX_RULE_TEXT_BYTES
+        ));
+    }
+    encode_transparent_start_command(config)?;
+    Ok(())
+}
+
+fn is_ipv6_link_local(ip: IpAddr) -> bool {
+    matches!(ip, IpAddr::V6(ip) if ip.is_unicast_link_local())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ScopedIp {
+    ip: IpAddr,
+    zone: Option<String>,
+}
+
+impl ScopedIp {
+    fn canonical_text(&self) -> String {
+        match &self.zone {
+            Some(zone) => format!("{}%{zone}", self.ip),
+            None => self.ip.to_string(),
+        }
+    }
+}
+
+fn parse_scoped_ip(text: &str) -> Result<ScopedIp, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err("transparent listen address is empty".to_owned());
+    }
+    let (ip_text, zone) = match text.split_once('%') {
+        Some((ip_text, zone)) => {
+            if ip_text.is_empty() || zone.is_empty() || zone.contains('%') {
+                return Err(format!("invalid transparent listen address {text:?}"));
+            }
+            let index = zone.parse::<u32>().map_err(|_| {
+                format!("transparent interface zone must be a positive numeric index: {text:?}")
+            })?;
+            if index == 0 {
+                return Err(format!(
+                    "transparent interface zone must be a positive numeric index: {text:?}"
+                ));
+            }
+            let canonical_zone = index.to_string();
+            (ip_text, Some(canonical_zone))
+        }
+        None => (text, None),
+    };
+    let ip = IpAddr::from_str(ip_text)
+        .map_err(|error| format!("invalid transparent listen address {text:?}: {error}"))?;
+    if matches!(ip, IpAddr::V6(value) if is_ipv4_mapped(value)) {
+        return Err(format!(
+            "IPv4-mapped transparent listen address is not allowed: {text:?}"
+        ));
+    }
+    Ok(ScopedIp { ip, zone })
+}
+
+fn is_ipv4_mapped(ip: std::net::Ipv6Addr) -> bool {
+    let segments = ip.segments();
+    segments[0] == 0
+        && segments[1] == 0
+        && segments[2] == 0
+        && segments[3] == 0
+        && segments[4] == 0
+        && segments[5] == 0xffff
+}
+
 fn encode_start_command(config: &DnsProcessConfig) -> Result<Vec<u8>, String> {
     let mut command = serde_json::to_vec(&StartCommand {
         op: "start",
@@ -651,6 +1007,27 @@ fn encode_start_command(config: &DnsProcessConfig) -> Result<Vec<u8>, String> {
     if command.len() > MAX_COMMAND_BYTES {
         return Err(format!(
             "DNS proxy configuration exceeds the {} byte limit",
+            MAX_COMMAND_BYTES
+        ));
+    }
+    Ok(command)
+}
+
+fn encode_transparent_start_command(config: &TransparentDnsConfig) -> Result<Vec<u8>, String> {
+    let mut command = serde_json::to_vec(&TransparentStartCommand {
+        op: "start",
+        config: TransparentStartConfig {
+            transparent: true,
+            listen_addresses: &config.listen_addresses,
+            listen_port: config.listen_port,
+            rules: &config.rules,
+        },
+    })
+    .map_err(|error| format!("cannot encode transparent DNS configuration: {error}"))?;
+    command.push(b'\n');
+    if command.len() > MAX_COMMAND_BYTES {
+        return Err(format!(
+            "transparent DNS configuration exceeds the {} byte limit",
             MAX_COMMAND_BYTES
         ));
     }
@@ -673,6 +1050,30 @@ fn encode_reload_command(rules: &str) -> Result<Vec<u8>, String> {
     if command.len() > MAX_COMMAND_BYTES {
         return Err(format!(
             "DNS proxy reload exceeds the {} byte limit",
+            MAX_COMMAND_BYTES
+        ));
+    }
+    Ok(command)
+}
+
+fn encode_flow_command(
+    operation: &'static str,
+    flow: &TransparentFlowRegistration,
+) -> Result<Vec<u8>, String> {
+    if operation != "register" && operation != "release" {
+        return Err(format!(
+            "unsupported transparent flow operation {operation:?}"
+        ));
+    }
+    let mut command = serde_json::to_vec(&FlowCommand {
+        op: operation,
+        flow,
+    })
+    .map_err(|error| format!("cannot encode transparent DNS flow command: {error}"))?;
+    command.push(b'\n');
+    if command.len() > MAX_COMMAND_BYTES {
+        return Err(format!(
+            "transparent DNS flow command exceeds the {} byte limit",
             MAX_COMMAND_BYTES
         ));
     }
@@ -1132,7 +1533,7 @@ fn ready_status(status: WireStatus) -> Result<DnsProcessStatus, String> {
     let udp_addrs = status.udp_addrs.unwrap_or_else(|| vec![udp_addr.clone()]);
     let tcp_addrs = status.tcp_addrs.unwrap_or_else(|| vec![tcp_addr.clone()]);
     for (primary, addresses) in [(&udp_addr, &udp_addrs), (&tcp_addr, &tcp_addrs)] {
-        if addresses.is_empty() || addresses.len() > 2 || addresses.first() != Some(primary) {
+        if addresses.is_empty() || addresses.len() > 16 || addresses.first() != Some(primary) {
             return Err("DNS proxy listener list is inconsistent".into());
         }
         for address in addresses {
@@ -1145,6 +1546,169 @@ fn ready_status(status: WireStatus) -> Result<DnsProcessStatus, String> {
         udp_addrs,
         tcp_addrs,
         rules_count: status.rules_count.unwrap_or(0),
+        slots: status.slots.unwrap_or_default(),
+    })
+}
+
+fn validate_transparent_listeners(
+    status: &DnsProcessStatus,
+    config: &TransparentDnsConfig,
+) -> Result<(), String> {
+    validate_transparent_config(config)?;
+    let expected = config
+        .listen_addresses
+        .iter()
+        .map(|address| parse_scoped_ip(address))
+        .collect::<Result<Vec<_>, _>>()?;
+    if status.udp_addrs.len() != expected.len() || status.tcp_addrs.len() != expected.len() {
+        return Err("DNS proxy transparent listener count does not match the request".to_owned());
+    }
+
+    let mut listener_udp = Vec::with_capacity(expected.len());
+    let mut listener_tcp = Vec::with_capacity(expected.len());
+    for (index, expected_ip) in expected.iter().enumerate() {
+        let udp = parse_scoped_socket_addr(&status.udp_addrs[index])?;
+        let tcp = parse_scoped_socket_addr(&status.tcp_addrs[index])?;
+        validate_transparent_listener_endpoint(
+            "UDP",
+            index,
+            expected_ip,
+            &udp,
+            config.listen_port,
+        )?;
+        validate_transparent_listener_endpoint(
+            "TCP",
+            index,
+            expected_ip,
+            &tcp,
+            config.listen_port,
+        )?;
+        listener_udp.push(udp);
+        listener_tcp.push(tcp);
+    }
+
+    let expected_slot_count = expected
+        .len()
+        .checked_mul(8)
+        .ok_or_else(|| "transparent upstream slot count overflowed".to_owned())?;
+    if status.slots.len() != expected_slot_count {
+        return Err(format!(
+            "DNS proxy reported {} upstream slots, expected {expected_slot_count}",
+            status.slots.len()
+        ));
+    }
+
+    let mut seen_udp = std::collections::HashSet::with_capacity(status.slots.len());
+    let mut seen_tcp = std::collections::HashSet::with_capacity(status.slots.len());
+    for (index, slot) in status.slots.iter().enumerate() {
+        if slot.id != index {
+            return Err("DNS proxy upstream slot IDs are not contiguous".to_owned());
+        }
+        let address_index = index / 8;
+        let udp = parse_scoped_socket_addr(&slot.udp_addr)?;
+        let tcp = parse_scoped_socket_addr(&slot.tcp_addr)?;
+        validate_transparent_slot_endpoint("UDP", index, &expected[address_index], &udp)?;
+        validate_transparent_slot_endpoint("TCP", index, &expected[address_index], &tcp)?;
+        if !seen_udp.insert(udp.canonical_text()) || !seen_tcp.insert(tcp.canonical_text()) {
+            return Err("DNS proxy upstream slot endpoints are duplicated".to_owned());
+        }
+        if listener_udp
+            .iter()
+            .any(|listener| listener.canonical_text() == udp.canonical_text())
+            || listener_tcp
+                .iter()
+                .any(|listener| listener.canonical_text() == tcp.canonical_text())
+        {
+            return Err("DNS proxy upstream slot overlaps a transparent listener".to_owned());
+        }
+    }
+    Ok(())
+}
+
+fn validate_transparent_listener_endpoint(
+    protocol: &str,
+    index: usize,
+    expected_ip: &ScopedIp,
+    actual: &ScopedSocketAddr,
+    requested_port: u16,
+) -> Result<(), String> {
+    if actual.ip != *expected_ip {
+        return Err(format!(
+            "DNS proxy {protocol} listener {index} does not match the requested IP/zone"
+        ));
+    }
+    if actual.port == 0 || actual.port == 53 {
+        return Err(format!(
+            "DNS proxy {protocol} listener {index} has an invalid port"
+        ));
+    }
+    if requested_port != 0 && actual.port != requested_port {
+        return Err(format!(
+            "DNS proxy {protocol} listener {index} did not bind the requested port"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_transparent_slot_endpoint(
+    protocol: &str,
+    index: usize,
+    expected_ip: &ScopedIp,
+    actual: &ScopedSocketAddr,
+) -> Result<(), String> {
+    if actual.ip != *expected_ip || actual.port == 0 || actual.port == 53 {
+        return Err(format!(
+            "DNS proxy {protocol} upstream slot {index} has an invalid IP/zone/port"
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ScopedSocketAddr {
+    ip: ScopedIp,
+    port: u16,
+}
+
+impl ScopedSocketAddr {
+    fn canonical_text(&self) -> String {
+        if self.ip.ip.is_ipv6() {
+            format!("[{}]:{}", self.ip.canonical_text(), self.port)
+        } else {
+            format!("{}:{}", self.ip.canonical_text(), self.port)
+        }
+    }
+}
+
+fn parse_scoped_socket_addr(text: &str) -> Result<ScopedSocketAddr, String> {
+    let text = text.trim();
+    let (host, port_text) = if let Some(rest) = text.strip_prefix('[') {
+        let close = rest
+            .find(']')
+            .ok_or_else(|| format!("invalid DNS proxy endpoint {text:?}"))?;
+        let host = &rest[..close];
+        let port = rest
+            .get(close + 1..)
+            .and_then(|value| value.strip_prefix(':'))
+            .ok_or_else(|| format!("invalid DNS proxy endpoint {text:?}"))?;
+        (host, port)
+    } else {
+        let (host, port) = text
+            .rsplit_once(':')
+            .ok_or_else(|| format!("invalid DNS proxy endpoint {text:?}"))?;
+        if host.contains(':') {
+            return Err(format!(
+                "IPv6 DNS proxy endpoint must use brackets: {text:?}"
+            ));
+        }
+        (host, port)
+    };
+    let port = port_text
+        .parse::<u16>()
+        .map_err(|error| format!("invalid DNS proxy endpoint {text:?}: {error}"))?;
+    Ok(ScopedSocketAddr {
+        ip: parse_scoped_ip(host)?,
+        port,
     })
 }
 
@@ -1194,12 +1758,9 @@ fn validate_listeners(
 }
 
 fn validate_ready_address(name: &str, address: &str) -> Result<(), String> {
-    let parsed = SocketAddr::from_str(address)
+    let parsed = parse_scoped_socket_addr(address)
         .map_err(|error| format!("DNS proxy ready {name} is invalid: {error}"))?;
-    if !parsed.ip().is_loopback() {
-        return Err(format!("DNS proxy ready {name} is not loopback"));
-    }
-    if parsed.port() == 0 {
+    if parsed.port == 0 {
         return Err(format!("DNS proxy ready {name} has port zero"));
     }
     Ok(())
@@ -1214,6 +1775,67 @@ fn wire_error(status: &WireStatus) -> String {
             || "DNS proxy reported an error without a message".to_owned(),
             ToOwned::to_owned,
         )
+}
+
+fn validate_ready_status(status: &WireStatus) -> Result<(), String> {
+    if status.error.is_some() {
+        return Err("DNS proxy ready status carried an unexpected error".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_empty_status(status: &WireStatus, context: &str) -> Result<(), String> {
+    if status.error.is_some()
+        || status.udp_addr.is_some()
+        || status.tcp_addr.is_some()
+        || status.udp_addrs.is_some()
+        || status.tcp_addrs.is_some()
+        || status.rules_count.is_some()
+        || status.slots.is_some()
+    {
+        return Err(format!(
+            "DNS proxy {context} status carried unexpected fields"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_error_status(status: &WireStatus, context: &str) -> Result<(), String> {
+    if match status.error.as_deref() {
+        None => true,
+        Some(error) => error.trim().is_empty(),
+    } {
+        return Err(format!(
+            "DNS proxy {context} error status omitted an error message"
+        ));
+    }
+    if status.udp_addr.is_some()
+        || status.tcp_addr.is_some()
+        || status.udp_addrs.is_some()
+        || status.tcp_addrs.is_some()
+        || status.rules_count.is_some()
+        || status.slots.is_some()
+    {
+        return Err(format!(
+            "DNS proxy {context} error status carried unexpected fields"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_updated_status(status: &WireStatus) -> Result<(), String> {
+    if status.error.is_some()
+        || status.udp_addr.is_some()
+        || status.tcp_addr.is_some()
+        || status.udp_addrs.is_some()
+        || status.tcp_addrs.is_some()
+        || status.slots.is_some()
+    {
+        return Err("DNS proxy updated status carried an invalid payload".to_owned());
+    }
+    // The companion serializes a zero count with `omitempty`; in that case
+    // an otherwise bare `updated` acknowledgement means zero rules.
+    Ok(())
 }
 
 fn stop_running(mut running: Running, send_stop: bool) -> Result<(), String> {
@@ -1252,15 +1874,34 @@ fn stop_running(mut running: Running, send_stop: bool) -> Result<(), String> {
             {
                 Ok(ReaderEvent::Line(line)) => match parse_wire_status(&line) {
                     Ok(status) if status.status == "stopped" => {
-                        stopped = true;
+                        if let Err(error) = validate_empty_status(&status, "stopped") {
+                            first_error.get_or_insert(error);
+                        } else {
+                            stopped = true;
+                        }
                         break;
                     }
                     Ok(status) if status.status == "error" => {
-                        first_error.get_or_insert_with(|| wire_error(&status));
+                        match validate_error_status(&status, "stop") {
+                            Ok(()) => {
+                                first_error.get_or_insert_with(|| wire_error(&status));
+                            }
+                            Err(error) => {
+                                first_error.get_or_insert(error);
+                                break;
+                            }
+                        }
                     }
-                    Ok(_) => {}
+                    Ok(status) => {
+                        first_error.get_or_insert(format!(
+                            "DNS proxy reported unsupported stop status {:?}",
+                            status.status
+                        ));
+                        break;
+                    }
                     Err(error) => {
                         first_error.get_or_insert(error);
+                        break;
                     }
                 },
                 Ok(ReaderEvent::Error(error)) => {
@@ -2054,6 +2695,259 @@ mod tests {
         assert!(command.ends_with(b"\n"));
         assert!(serde_json::from_slice::<serde_json::Value>(&command[..command.len() - 1]).is_ok());
         assert!(encode_reload_command(&"x".repeat(MAX_RULE_TEXT_BYTES + 1)).is_err());
+    }
+
+    #[test]
+    fn transparent_start_and_flow_commands_preserve_scoped_wire_shape() {
+        let config = TransparentDnsConfig {
+            listen_addresses: vec!["127.0.0.1".to_owned(), "fe80::1%3".to_owned()],
+            listen_port: 0,
+            rules: "||ads.example^".to_owned(),
+        };
+        validate_transparent_config(&config).expect("valid transparent config");
+        let start = encode_transparent_start_command(&config).expect("encode transparent start");
+        let start: serde_json::Value = serde_json::from_slice(&start[..start.len() - 1]).unwrap();
+        assert_eq!(start["op"], "start");
+        assert_eq!(start["config"]["transparent"], true);
+        assert_eq!(start["config"]["listen_addresses"][1], "fe80::1%3");
+
+        let flow = TransparentFlowRegistration {
+            protocol: "udp".to_owned(),
+            peer: "192.0.2.10:53000".to_owned(),
+            local: "127.0.0.1:5300".to_owned(),
+            resolver: "192.0.2.53:53".to_owned(),
+            slot: 7,
+            lifetime_ms: 120_000,
+        };
+        let command = encode_flow_command("register", &flow).expect("encode flow command");
+        let command: serde_json::Value =
+            serde_json::from_slice(&command[..command.len() - 1]).unwrap();
+        assert_eq!(command["op"], "register");
+        assert_eq!(command["flow"]["slot"], 7);
+        assert_eq!(command["flow"]["lifetime_ms"], 120_000u64);
+    }
+
+    #[test]
+    fn command_ack_shapes_reject_unexpected_known_fields() {
+        let empty = |status: &str| WireStatus {
+            status: status.to_owned(),
+            error: None,
+            udp_addr: None,
+            tcp_addr: None,
+            udp_addrs: None,
+            tcp_addrs: None,
+            rules_count: None,
+            slots: None,
+        };
+
+        let mut registered = empty("registered");
+        validate_empty_status(&registered, "register").expect("bare register ack");
+        registered.rules_count = Some(1);
+        assert!(validate_empty_status(&registered, "register").is_err());
+
+        let mut rejected = empty("error");
+        rejected.error = Some("flow is not registered".to_owned());
+        validate_error_status(&rejected, "release").expect("bare error ack");
+        rejected.slots = Some(Vec::new());
+        assert!(validate_error_status(&rejected, "release").is_err());
+
+        let mut updated = empty("updated");
+        updated.rules_count = Some(2);
+        validate_updated_status(&updated).expect("rules-only reload ack");
+        updated.tcp_addr = Some("127.0.0.1:53".to_owned());
+        assert!(validate_updated_status(&updated).is_err());
+    }
+
+    #[test]
+    fn transparent_readiness_requires_exact_zones_and_eight_distinct_slots() {
+        let config = TransparentDnsConfig {
+            listen_addresses: vec!["fe80::1%3".to_owned()],
+            listen_port: 5300,
+            rules: String::new(),
+        };
+        let slots = (0..8)
+            .map(|id| UpstreamSlot {
+                id,
+                udp_addr: format!("[fe80::1%3]:{}", 42000 + id),
+                tcp_addr: format!("[fe80::1%3]:{}", 43000 + id),
+            })
+            .collect();
+        let status = DnsProcessStatus {
+            udp_addr: "[fe80::1%3]:5300".to_owned(),
+            tcp_addr: "[fe80::1%3]:5300".to_owned(),
+            udp_addrs: vec!["[fe80::1%3]:5300".to_owned()],
+            tcp_addrs: vec!["[fe80::1%3]:5300".to_owned()],
+            rules_count: 0,
+            slots,
+        };
+        validate_transparent_listeners(&status, &config).expect("exact scoped readiness");
+
+        let mut wrong_zone = status.clone();
+        wrong_zone.udp_addrs[0] = "[fe80::1%4]:5300".to_owned();
+        assert!(validate_transparent_listeners(&wrong_zone, &config).is_err());
+
+        let mut missing_slot = status.clone();
+        missing_slot.slots.pop();
+        assert!(validate_transparent_listeners(&missing_slot, &config).is_err());
+
+        let mut overlapping = status;
+        overlapping.slots[0].udp_addr = "[fe80::1%3]:5300".to_owned();
+        assert!(validate_transparent_listeners(&overlapping, &config).is_err());
+    }
+
+    #[test]
+    fn transparent_config_rejects_wildcards_bad_zones_and_reserved_port() {
+        for config in [
+            TransparentDnsConfig {
+                listen_addresses: vec!["0.0.0.0".to_owned()],
+                listen_port: 0,
+                rules: String::new(),
+            },
+            TransparentDnsConfig {
+                listen_addresses: vec!["127.0.0.1%3".to_owned()],
+                listen_port: 0,
+                rules: String::new(),
+            },
+            TransparentDnsConfig {
+                listen_addresses: vec!["::1%3".to_owned()],
+                listen_port: 0,
+                rules: String::new(),
+            },
+            TransparentDnsConfig {
+                listen_addresses: vec!["::ffff:127.0.0.1".to_owned()],
+                listen_port: 0,
+                rules: String::new(),
+            },
+            TransparentDnsConfig {
+                listen_addresses: vec!["fe80::1".to_owned()],
+                listen_port: 0,
+                rules: String::new(),
+            },
+            TransparentDnsConfig {
+                listen_addresses: vec!["fe80::1%0".to_owned()],
+                listen_port: 0,
+                rules: String::new(),
+            },
+            TransparentDnsConfig {
+                listen_addresses: vec!["fe80::1%Ethernet".to_owned()],
+                listen_port: 0,
+                rules: String::new(),
+            },
+            TransparentDnsConfig {
+                listen_addresses: vec!["127.0.0.1".to_owned()],
+                listen_port: 53,
+                rules: String::new(),
+            },
+        ] {
+            assert!(validate_transparent_config(&config).is_err());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires the real unelevated transparent companion; no DNS or system settings are changed"]
+    fn starts_real_transparent_companion_registers_and_releases_flow() {
+        let path = test_directory("transparent-start");
+        let manager = DnsProcessManager::new(path.clone());
+        let status = manager
+            .start_transparent(TransparentDnsConfig {
+                listen_addresses: vec!["127.0.0.1".to_owned()],
+                listen_port: 0,
+                rules: "||blocked.example.test^".to_owned(),
+            })
+            .expect("real transparent companion should start unelevated");
+        assert_eq!(status.udp_addrs.len(), 1);
+        assert_eq!(status.tcp_addrs.len(), 1);
+        assert_eq!(status.slots.len(), 8);
+
+        let listener: SocketAddr = status.udp_addrs[0]
+            .parse()
+            .expect("transparent UDP listener address");
+        let filter_config = crate::protection::dns_filter::DnsFilterConfig {
+            local_ips: vec![listener.ip()],
+            udp_proxy_listeners: status
+                .udp_addrs
+                .iter()
+                .map(|address| address.parse().expect("UDP listener endpoint"))
+                .collect(),
+            tcp_proxy_listeners: status
+                .tcp_addrs
+                .iter()
+                .map(|address| address.parse().expect("TCP listener endpoint"))
+                .collect(),
+            udp_upstreams: status
+                .slots
+                .iter()
+                .map(|slot| slot.udp_addr.parse().expect("UDP slot endpoint"))
+                .collect(),
+            tcp_upstreams: status
+                .slots
+                .iter()
+                .map(|slot| slot.tcp_addr.parse().expect("TCP slot endpoint"))
+                .collect(),
+        };
+        let filters = crate::protection::dns_filter::build_dns_filters(&filter_config)
+            .expect("transparent readiness should build complete DNS filters");
+        assert_eq!(filters.len(), 1);
+        assert!(filters[0].contains(&listener.ip().to_string()));
+        let client =
+            std::net::UdpSocket::bind("127.0.0.1:0").expect("transparent UDP client socket");
+        client
+            .connect(listener)
+            .expect("transparent UDP client connect");
+        let peer = client
+            .local_addr()
+            .expect("transparent UDP client local address");
+        assert_ne!(peer.port(), listener.port());
+        let flow = TransparentFlowRegistration {
+            protocol: "udp".to_owned(),
+            peer: peer.to_string(),
+            local: listener.to_string(),
+            resolver: "127.0.0.1:53".to_owned(),
+            slot: status.slots[0].id,
+            lifetime_ms: 120_000,
+        };
+        manager
+            .register_flow(flow.clone())
+            .expect("transparent flow should register");
+        let mut query = vec![
+            0x12, 0x34, // transaction ID
+            0x01, 0x00, // recursion desired
+            0x00, 0x01, // one question
+            0x00, 0x00, // no answers
+            0x00, 0x00, // no authority records
+            0x00, 0x00, // no additional records
+        ];
+        for label in ["blocked", "example", "test"] {
+            query.push(label.len() as u8);
+            query.extend_from_slice(label.as_bytes());
+        }
+        query.extend_from_slice(&[0, 0, 1, 0, 1]); // root, A, IN
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set DNS response timeout");
+        client.send(&query).expect("send authorized DNS query");
+        let mut response = [0u8; 2048];
+        let response_len = client.recv(&mut response).expect("blocked DNS response");
+        assert!(response_len >= 12);
+        assert_eq!(&response[..2], &query[..2]);
+        assert_eq!(u16::from_be_bytes([response[2], response[3]]) & 0x000f, 3);
+        manager
+            .release_flow(flow.clone())
+            .expect("transparent flow should release");
+        assert!(manager.register_flow(flow).is_err());
+        assert!(manager
+            .status()
+            .expect("status after rejected flow")
+            .is_some());
+        client
+            .set_read_timeout(Some(Duration::from_millis(250)))
+            .expect("set released DNS timeout");
+        client.send(&query).expect("send released DNS query");
+        assert!(client.recv(&mut response).is_err());
+        manager.stop().expect("transparent companion should stop");
+        assert_eq!(manager.status().expect("stopped status"), None);
+        let _ = fs::remove_dir_all(path);
     }
 
     #[test]

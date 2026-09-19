@@ -3,11 +3,56 @@ package main
 import (
 	"net"
 	"net/netip"
+	"strconv"
 	"testing"
 	"time"
 
 	"github.com/miekg/dns"
 )
+
+func TestTransparentReadyReportsNumericIPv6Scope(t *testing.T) {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, iface := range interfaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Index <= 0 {
+			continue
+		}
+		addresses, err := iface.Addrs()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, address := range addresses {
+			ip, _, err := net.ParseCIDR(address.String())
+			if err != nil || ip.To4() != nil || !ip.IsLinkLocalUnicast() {
+				continue
+			}
+			// Only bind local ephemeral sockets; never send packets or change DNS.
+			service := &serviceRuntime{}
+			ready, err := service.start(config{Transparent: true, ListenAddresses: []string{ip.String() + "%" + iface.Name}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = service.stop() })
+			all := append(append([]string{}, ready.UDPAddrs...), ready.TCPAddrs...)
+			for _, slot := range ready.Slots {
+				all = append(all, slot.UDPAddr, slot.TCPAddr)
+			}
+			for _, text := range all {
+				endpoint, err := netip.ParseAddrPort(text)
+				if err != nil || endpoint.Addr().Zone() != strconv.Itoa(iface.Index) {
+					t.Fatal("readiness must use numeric interface indices for every scoped endpoint")
+				}
+			}
+			if err := service.stop(); err != nil {
+				t.Fatal(err)
+			}
+			return
+		}
+	}
+	t.Skip("no active IPv6 link-local address available")
+}
 
 func TestTransparentServiceReadyRegistrationBlockReleaseAndCleanup(t *testing.T) {
 	runtime := &serviceRuntime{}

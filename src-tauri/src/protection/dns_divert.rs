@@ -2,12 +2,13 @@
 
 use std::os::windows::ffi::OsStrExt;
 use std::{
-    ffi::{c_char, c_void, CString},
+    ffi::{c_char, c_void, CStr, CString},
     path::Path,
     sync::Arc,
 };
 
 const MAX_PACKET: usize = 65_575;
+const MAX_FILTER_BYTES: usize = 32 * 1024;
 type Handle = *mut c_void;
 type Open = unsafe extern "C" fn(*const c_char, i32, i16, u64) -> Handle;
 type Recv = unsafe extern "C" fn(Handle, *mut c_void, u32, *mut u32, *mut Address) -> i32;
@@ -16,6 +17,8 @@ type Shutdown = unsafe extern "C" fn(Handle, u32) -> i32;
 type Close = unsafe extern "C" fn(Handle) -> i32;
 type Param = unsafe extern "C" fn(Handle, i32, u64) -> i32;
 type Checksums = unsafe extern "C" fn(*mut c_void, u32, *mut Address, u64) -> i32;
+type CompileFilter =
+    unsafe extern "C" fn(*const c_char, i32, *mut c_char, u32, *mut *const c_char, *mut u32) -> i32;
 
 #[link(name = "kernel32")]
 extern "system" {
@@ -23,6 +26,8 @@ extern "system" {
     fn GetProcAddress(module: Handle, name: *const u8) -> *mut c_void;
     fn FreeLibrary(module: Handle) -> i32;
     fn GetLastError() -> u32;
+    #[cfg(test)]
+    fn SetLastError(error: u32);
 }
 
 #[repr(C)]
@@ -74,6 +79,7 @@ struct Api {
     close: Close,
     param: Param,
     checksums: Checksums,
+    compile_filter: CompileFilter,
 }
 impl Drop for Api {
     fn drop(&mut self) {
@@ -124,6 +130,10 @@ impl Api {
                     module,
                     b"WinDivertHelperCalcChecksums\0",
                 )?),
+                compile_filter: std::mem::transmute::<*mut c_void, CompileFilter>(symbol(
+                    module,
+                    b"WinDivertHelperCompileFilter\0",
+                )?),
             })
         })();
         if result.is_err() {
@@ -133,10 +143,39 @@ impl Api {
         }
         result.map(Arc::new)
     }
+
+    fn compile_filter(&self, filter: &CString) -> Result<(), String> {
+        let mut description = std::ptr::null();
+        let mut position = 0;
+        let success = unsafe {
+            (self.compile_filter)(
+                filter.as_ptr(),
+                0,
+                std::ptr::null_mut(),
+                0,
+                &mut description,
+                &mut position,
+            )
+        };
+        if success != 0 {
+            return Ok(());
+        }
+        // The official helper returns a static error string owned by this DLL.
+        let message = if description.is_null() {
+            "unknown filter error".into()
+        } else {
+            unsafe { CStr::from_ptr(description) }
+                .to_string_lossy()
+                .into_owned()
+        };
+        Err(format!(
+            "Invalid DNS interception filter at {position}: {message}"
+        ))
+    }
 }
 
 fn validate_filter(filter: &str) -> Result<CString, String> {
-    if filter.trim().is_empty() || filter.len() > 4096 {
+    if filter.trim().is_empty() || filter.len() > MAX_FILTER_BYTES {
         return Err("DNS interception filter is empty or too large".into());
     }
     CString::new(filter).map_err(|_| "DNS interception filter contains NUL".into())
@@ -161,6 +200,7 @@ impl ActiveHandle {
         Self::open_with_api(Api::load(&path)?, &filter)
     }
     fn open_with_api(api: Arc<Api>, filter: &CString) -> Result<Arc<Self>, String> {
+        api.compile_filter(filter)?;
         // Passive app capture at priority 0 sees the original tuple first.
         let handle = unsafe { (api.open)(filter.as_ptr(), 0, -1000, 0) };
         if handle.is_null() || handle as usize == usize::MAX {
@@ -325,6 +365,16 @@ mod tests {
     unsafe extern "C" fn checksums(_: *mut c_void, _: u32, _: *mut Address, _: u64) -> i32 {
         i32::from(!FAKE.lock().unwrap().checksum_failure)
     }
+    unsafe extern "C" fn compile_filter(
+        _: *const c_char,
+        _: i32,
+        _: *mut c_char,
+        _: u32,
+        _: *mut *const c_char,
+        _: *mut u32,
+    ) -> i32 {
+        1
+    }
     fn api() -> Arc<Api> {
         Arc::new(Api {
             module: 0,
@@ -335,6 +385,7 @@ mod tests {
             close,
             param,
             checksums,
+            compile_filter,
         })
     }
     fn reset() {
@@ -421,10 +472,281 @@ mod tests {
 
     #[test]
     fn filter_input_rejects_empty_overlong_or_nul_before_loading_driver() {
-        for filter in ["", "  ", "udp\0or tcp", &"x".repeat(4097)] {
+        for filter in ["", "  ", "udp\0or tcp", &"x".repeat(MAX_FILTER_BYTES + 1)] {
             assert!(validate_filter(filter).is_err());
         }
         assert!(validate_filter("outbound and udp.DstPort == 53001").is_ok());
+    }
+
+    #[test]
+    fn native_filter_compiler_validates_without_opening_driver() {
+        let directory =
+            std::env::temp_dir().join(format!("vapour-dns-filter-{}", std::process::id()));
+        let path = crate::capture::stage_divert_runtime(&directory).unwrap();
+        let api = Api::load(&path).unwrap();
+        assert!(api
+            .compile_filter(&validate_filter("outbound and udp.DstPort == 53").unwrap())
+            .is_ok());
+        assert!(api
+            .compile_filter(&validate_filter("not_a_windivert_field == 1").unwrap())
+            .is_err());
+        drop(api);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn generated_filter_matches_only_covered_requests_and_owned_proxy_replies() {
+        use crate::protection::dns_filter::{build_dns_filter, build_dns_filters, DnsFilterConfig};
+        use std::net::{IpAddr, SocketAddr};
+        type Evaluate =
+            unsafe extern "C" fn(*const c_char, *const c_void, u32, *const Address) -> i32;
+
+        // Loading and evaluating the user-mode helper never calls WinDivertOpen.
+        let directory =
+            std::env::temp_dir().join(format!("vapour-dns-filter-eval-{}", std::process::id()));
+        let path = crate::capture::stage_divert_runtime(&directory).unwrap();
+        let api = Api::load(&path).unwrap();
+        let symbol = unsafe {
+            GetProcAddress(
+                api.module as Handle,
+                b"WinDivertHelperEvalFilter\0".as_ptr(),
+            )
+        };
+        assert!(!symbol.is_null());
+        let evaluate: Evaluate = unsafe { std::mem::transmute(symbol) };
+        let ips: Vec<IpAddr> = ["192.0.2.10", "2001:db8::10"]
+            .into_iter()
+            .map(|ip| ip.parse().unwrap())
+            .collect();
+        let mut config = DnsFilterConfig {
+            local_ips: ips.clone(),
+            udp_proxy_listeners: ips.iter().map(|ip| SocketAddr::new(*ip, 40000)).collect(),
+            tcp_proxy_listeners: ips.iter().map(|ip| SocketAddr::new(*ip, 40001)).collect(),
+            udp_upstreams: ips
+                .iter()
+                .flat_map(|ip| (41000..41008).map(move |port| SocketAddr::new(*ip, port)))
+                .collect(),
+            tcp_upstreams: ips
+                .iter()
+                .flat_map(|ip| (42000..42008).map(move |port| SocketAddr::new(*ip, port)))
+                .collect(),
+        };
+        // A covered second IPv4 address owns different ports. A port exempt
+        // on the first address must still be intercepted on this address.
+        let second: IpAddr = "192.0.2.11".parse().unwrap();
+        config.local_ips.push(second);
+        config
+            .udp_proxy_listeners
+            .push(SocketAddr::new(second, 40002));
+        config
+            .tcp_proxy_listeners
+            .push(SocketAddr::new(second, 40003));
+        config
+            .udp_upstreams
+            .extend((43000..43008).map(|p| SocketAddr::new(second, p)));
+        config
+            .tcp_upstreams
+            .extend((44000..44008).map(|p| SocketAddr::new(second, p)));
+        let filter = validate_filter(&build_dns_filter(&config).unwrap()).unwrap();
+        api.compile_filter(&filter)
+            .unwrap_or_else(|error| panic!("{error}: {filter:?}"));
+        for (local, remote, other) in [
+            ("192.0.2.10", "198.51.100.53", "192.0.2.12"),
+            ("2001:db8::10", "2001:db8:1::53", "2001:db8::11"),
+        ] {
+            for tcp in [false, true] {
+                let owned = if tcp { 42000 } else { 41000 };
+                let other_protocol_owned = if tcp { 41000 } else { 42000 };
+                let proxy = if tcp { 40001 } else { 40000 };
+                for (source, source_port, destination_port, outbound, expected) in [
+                    (local, 45000, 53, true, true),
+                    (local, owned, 53, true, false),
+                    (local, owned + 7, 53, true, false),
+                    (local, owned + 8, 53, true, true),
+                    (local, other_protocol_owned, 53, true, true),
+                    (other, 45000, 53, true, false),
+                    (local, 45000, 443, true, false),
+                    (local, 45000, 53, false, false),
+                    (local, proxy, 45000, true, true),
+                    (other, proxy, 45000, true, false),
+                    (remote, 53, owned, false, false),
+                ] {
+                    let source = SocketAddr::new(source.parse().unwrap(), source_port);
+                    let destination = SocketAddr::new(remote.parse().unwrap(), destination_port);
+                    let packet = filter_fixture(source, destination, tcp);
+                    let mut address = Address::default();
+                    address.set_outbound(outbound);
+                    address.set_interface(7, 0);
+                    if source.is_ipv6() {
+                        address.bits |= 1 << 20;
+                    }
+                    let actual = unsafe {
+                        SetLastError(0);
+                        evaluate(
+                            filter.as_ptr(),
+                            packet.as_ptr().cast(),
+                            packet.len() as u32,
+                            &address,
+                        )
+                    };
+                    assert_eq!(
+                        actual != 0,
+                        expected,
+                        "{source} -> {destination}, tcp={tcp}, outbound={outbound}"
+                    );
+                    // Win32 last-error is meaningful only on FALSE here;
+                    // successful evaluation may leave an internal parser error.
+                    if actual == 0 {
+                        assert_eq!(unsafe { GetLastError() }, 0, "native error for {source} -> {destination}, tcp={tcp}, outbound={outbound}");
+                    }
+                }
+            }
+        }
+        for tcp in [false, true] {
+            let packet = filter_fixture(
+                SocketAddr::new(second, if tcp { 42000 } else { 41000 }),
+                "198.51.100.53:53".parse().unwrap(),
+                tcp,
+            );
+            let mut address = Address::default();
+            address.set_outbound(true);
+            assert_ne!(
+                unsafe {
+                    evaluate(
+                        filter.as_ptr(),
+                        packet.as_ptr().cast(),
+                        packet.len() as u32,
+                        &address,
+                    )
+                },
+                0
+            );
+        }
+        let ips: Vec<IpAddr> = (1..=16)
+            .map(|i| format!("2001:db8:{i:x}::1").parse().unwrap())
+            .collect();
+        let maximal = DnsFilterConfig {
+            local_ips: ips.clone(),
+            udp_proxy_listeners: ips.iter().map(|ip| SocketAddr::new(*ip, 40000)).collect(),
+            tcp_proxy_listeners: ips.iter().map(|ip| SocketAddr::new(*ip, 40001)).collect(),
+            udp_upstreams: ips
+                .iter()
+                .flat_map(|ip| (41000..41008).map(move |p| SocketAddr::new(*ip, p)))
+                .collect(),
+            tcp_upstreams: ips
+                .iter()
+                .flat_map(|ip| (42000..42008).map(move |p| SocketAddr::new(*ip, p)))
+                .collect(),
+        };
+        let filters: Vec<_> = build_dns_filters(&maximal)
+            .unwrap()
+            .iter()
+            .map(|filter| validate_filter(filter).unwrap())
+            .collect();
+        assert_eq!(filters.len(), 4);
+        for filter in &filters {
+            api.compile_filter(filter).unwrap();
+        }
+        for ip in ips {
+            for tcp in [false, true] {
+                for (port, expected_matches) in [(45000, 1), (if tcp { 42000 } else { 41000 }, 0)] {
+                    let packet = filter_fixture(
+                        SocketAddr::new(ip, port),
+                        "[2001:db8:ff::53]:53".parse().unwrap(),
+                        tcp,
+                    );
+                    let mut address = Address::default();
+                    address.set_outbound(true);
+                    address.bits |= 1 << 20;
+                    let matches = filters.iter().filter(|filter| unsafe { evaluate(filter.as_ptr(), packet.as_ptr().cast(), packet.len() as u32, &address) } != 0).count();
+                    assert_eq!(
+                        matches, expected_matches,
+                        "disjoint coverage for {ip}:{port}, tcp={tcp}"
+                    );
+                }
+            }
+        }
+        let scoped = |port| {
+            std::net::SocketAddr::V6(std::net::SocketAddrV6::new(
+                "fe80::10".parse().unwrap(),
+                port,
+                0,
+                7,
+            ))
+        };
+        let scoped_config = DnsFilterConfig {
+            local_ips: vec!["fe80::10".parse().unwrap()],
+            udp_proxy_listeners: vec![scoped(40000)],
+            tcp_proxy_listeners: vec![scoped(40001)],
+            udp_upstreams: (41000..41008).map(scoped).collect(),
+            tcp_upstreams: (42000..42008).map(scoped).collect(),
+        };
+        let filter = validate_filter(&build_dns_filter(&scoped_config).unwrap()).unwrap();
+        api.compile_filter(&filter).unwrap();
+        for (interface, expected) in [(7, true), (8, false)] {
+            let mut address = Address::default();
+            address.set_outbound(true);
+            address.bits |= 1 << 20;
+            address.set_interface(interface, 0);
+            let packet = filter_fixture(
+                "[fe80::10]:45000".parse().unwrap(),
+                "[fe80::53]:53".parse().unwrap(),
+                false,
+            );
+            assert_eq!(
+                unsafe {
+                    evaluate(
+                        filter.as_ptr(),
+                        packet.as_ptr().cast(),
+                        packet.len() as u32,
+                        &address,
+                    )
+                } != 0,
+                expected
+            );
+        }
+        drop(api);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn filter_fixture(
+        source: std::net::SocketAddr,
+        destination: std::net::SocketAddr,
+        tcp: bool,
+    ) -> Vec<u8> {
+        use std::net::IpAddr;
+        let header = if source.is_ipv4() { 20 } else { 40 };
+        let transport = if tcp { 20 } else { 8 };
+        let mut packet = vec![0; header + transport];
+        let protocol = if tcp { 6 } else { 17 };
+        match (source.ip(), destination.ip()) {
+            (IpAddr::V4(source), IpAddr::V4(destination)) => {
+                packet[0] = 0x45;
+                packet[2..4].copy_from_slice(&((header + transport) as u16).to_be_bytes());
+                packet[8] = 64;
+                packet[9] = protocol;
+                packet[12..16].copy_from_slice(&source.octets());
+                packet[16..20].copy_from_slice(&destination.octets());
+            }
+            (IpAddr::V6(source), IpAddr::V6(destination)) => {
+                packet[0] = 0x60;
+                packet[4..6].copy_from_slice(&(transport as u16).to_be_bytes());
+                packet[6] = protocol;
+                packet[7] = 64;
+                packet[8..24].copy_from_slice(&source.octets());
+                packet[24..40].copy_from_slice(&destination.octets());
+            }
+            _ => panic!("fixture address-family mismatch"),
+        }
+        packet[header..header + 2].copy_from_slice(&source.port().to_be_bytes());
+        packet[header + 2..header + 4].copy_from_slice(&destination.port().to_be_bytes());
+        if tcp {
+            packet[header + 12] = 5 << 4;
+            packet[header + 13] = 2;
+        } else {
+            packet[header + 4..header + 6].copy_from_slice(&(transport as u16).to_be_bytes());
+        }
+        packet
     }
 
     /// Opt-in only: this opens an active driver handle, not a mock. The filter

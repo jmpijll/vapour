@@ -122,10 +122,29 @@ expired and released tuples remain quarantined until the session ends. Failed
 TCP connections retain their reserved socket until interception can be stopped.
 Local tests use synthetic endpoints and do not change adapter DNS settings.
 
+The Windows filter builder now checks complete companion bindings and emits
+disjoint filters covering at most four local addresses each. Sixteen addresses
+require four filter groups and, once integrated, four handles: the real WinDivert compiler rejects the
+larger single expression. Tests use the shipped DLL's compiler and evaluator
+without opening a driver handle. They verify IPv4/IPv6 UDP/TCP matching,
+protocol-specific source-port exclusions, different local addresses using the
+same port, numeric IPv6 interface scope and complete non-overlapping coverage.
+An additional local bind test verifies numeric IPv6 scope in every companion
+listener and reserved socket reported to the Rust controller.
+
+The Rust process manager now starts that mode, verifies all listener and slot
+bindings, and serializes bounded register/release commands alongside reload and
+stop. Unexpected acknowledgements or stream failure terminate the child;
+explicit command rejection preserves it. An unelevated integration test starts
+the real embedded companion, builds filters from its readiness response,
+registers a real local UDP client, receives a blocked response, releases that
+flow, verifies subsequent queries receive no response, and stops the process.
+No interception handle or system DNS changes are involved in this test.
+
 These checks do not establish end-to-end protection. Remaining work includes
 connecting the bounded packet/flow reflection to these listeners, installing
 the exact owned-port exclusions, session rollover, helper/driver failure recovery,
-graceful shutdown,
+graceful shutdown with a companion quiesce phase that retains reserved sockets,
 restart, periodic updates and the UI switch. Native tests must verify that
 adapter settings stay unchanged and that cleanup restores ordinary packet flow.
 VPN, NRPT and per-application routing still need explicit verification: retaining

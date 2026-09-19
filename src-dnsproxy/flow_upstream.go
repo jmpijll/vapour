@@ -52,7 +52,15 @@ func reserveFlowUpstream(local netip.Addr, timeout time.Duration) (*flowUpstream
 		_ = tcp.Close()
 		return nil, errors.New("unexpected UDP socket type")
 	}
-	return &flowUpstream{udp: udp, tcp: tcp, localUDP: udp.LocalAddr().(*net.UDPAddr).AddrPort(), localTCP: tcp.LocalAddr(), timeout: timeout, exchangeGate: make(chan struct{}, 1)}, nil
+	localUDP, err := canonicalEndpoint(udp.LocalAddr().(*net.UDPAddr).AddrPort())
+	if err != nil {
+		return nil, errors.Join(err, udp.Close(), tcp.Close())
+	}
+	localTCP, err := canonicalEndpoint(tcp.LocalAddr())
+	if err != nil {
+		return nil, errors.Join(err, udp.Close(), tcp.Close())
+	}
+	return &flowUpstream{udp: udp, tcp: tcp, localUDP: localUDP, localTCP: localTCP, timeout: timeout, exchangeGate: make(chan struct{}, 1)}, nil
 }
 func (s *flowUpstream) UDPAddr() netip.AddrPort { return s.localUDP }
 func (s *flowUpstream) TCPAddr() netip.AddrPort { return s.localTCP }

@@ -112,7 +112,11 @@ func newTransparentListeners(
 			return nil, errors.Join(fmt.Errorf("bind UDP listener %s: unexpected packet connection", address), l.closeBound())
 		}
 		l.udpConns = append(l.udpConns, udpConn)
-		l.udpAddrs = append(l.udpAddrs, udpConn.LocalAddr().String())
+		bound, err := transparentEndpoint(udpConn.LocalAddr())
+		if err != nil {
+			return nil, errors.Join(err, l.closeBound())
+		}
+		l.udpAddrs = append(l.udpAddrs, bound.String())
 	}
 
 	for index, requested := range tcpAddrs {
@@ -127,7 +131,11 @@ func newTransparentListeners(
 		}
 		limited := newTransparentTCPListener(listener)
 		l.tcpListeners = append(l.tcpListeners, limited)
-		l.tcpAddrs = append(l.tcpAddrs, listener.Addr().String())
+		bound, err := transparentEndpoint(listener.Addr())
+		if err != nil {
+			return nil, errors.Join(err, l.closeBound())
+		}
+		l.tcpAddrs = append(l.tcpAddrs, bound.String())
 	}
 
 	for _, packetConn := range l.udpConns {
