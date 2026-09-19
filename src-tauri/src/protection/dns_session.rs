@@ -321,6 +321,9 @@ pub(crate) struct DnsSession {
 }
 
 impl DnsSession {
+    pub(crate) fn generation_owned() -> bool {
+        GENERATION_OWNED.load(Ordering::Acquire)
+    }
     /// Start the helper, validate its ready bindings, open every disjoint
     /// filter, and start one receive worker per active handle.
     pub(crate) fn start(

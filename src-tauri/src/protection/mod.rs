@@ -5,6 +5,7 @@ pub mod dns_configuration;
 pub(crate) mod dns_divert;
 pub(crate) mod dns_filter;
 pub(crate) mod dns_flow;
+pub(crate) mod dns_generation;
 pub(crate) mod dns_packet;
 pub mod dns_process;
 pub(crate) mod dns_router;

@@ -187,8 +187,16 @@ stop timeout alone never means resources are released. A process-local generatio
 lease also covers failed starts and their detached cleanup, rejecting another
 start until the last owner exits after confirmed cleanup. Unconfirmed cleanup
 keeps admission closed for the process lifetime. This does not coordinate
-separate Vapour processes; cross-process exclusion and the automatic rollover
-controller remain outstanding.
+separate Vapour processes; cross-process exclusion remains outstanding.
+
+The internal generation controller now reconciles desired configuration with
+session ownership. Address order/duplicates do not trigger replacement, rule
+changes reload in place, and topology changes or exhaustion wait for confirmed
+cleanup before another start. Failed starts and rule updates back off; disabling
+cancels pending replacement. Seven deterministic lifecycle tests verify these
+decisions with injected sessions, including retained cleanup after startup
+failure. The native factory is compiled but not exercised by those tests. A
+background worker, live interface updates and the UI switch are not wired yet.
 
 These checks do not establish end-to-end protection. The driver-backed session
 tests are prepared in [DNS-NATIVE-TESTS.md](DNS-NATIVE-TESTS.md) but have not run.
