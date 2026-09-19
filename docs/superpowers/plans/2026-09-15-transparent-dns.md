@@ -58,6 +58,13 @@ Seven router unit tests and two real companion UDP round trips (IPv4/IPv6)
 pass without opening a driver. Slot/flow exhaustion requests rollover; the
 long-running generation controller and topology replacement remain outstanding.
 
+Live rule replacement is serialized by the session supervisor with stop. A
+structured parser rejection keeps the existing rules and session; an uncertain
+control exchange requests the same ordered shutdown as helper failure. A caller
+timeout reports a pending operation, not a rollback. Native acceptance includes
+adding and removing a rule without replacing resolver slots or interception
+handles. This does not yet wire automatic updates or the UI switch.
+
 1. Implement a pure IPv4/IPv6 packet reflection and mapping module. Retain the
    original local address, resolver address, interface, transport and ports.
    Validate IP and transport lengths, reject unsupported fragments/extensions,

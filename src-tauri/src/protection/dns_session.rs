@@ -7,7 +7,7 @@
 
 use super::{
     dns_divert::ActiveHandle,
-    dns_process::{DnsProcessManager, TransparentDnsConfig},
+    dns_process::{DnsProcessManager, TransparentDnsConfig, TransparentReloadError},
     dns_router::{PacketRouter, RouteError, RoutedPacket},
 };
 use std::{
@@ -256,6 +256,10 @@ struct RollbackOwnership {
 
 enum SupervisorCommand {
     Stop(Option<SyncSender<Result<(), String>>>),
+    Reload {
+        rules: String,
+        reply: SyncSender<Result<(), String>>,
+    },
 }
 
 /// One transparent DNS interception generation.
@@ -447,6 +451,39 @@ impl DnsSession {
 
     pub(crate) fn last_error(&self) -> Option<String> {
         self.state.error()
+    }
+
+    /// Submit a serialized live rule reload. A caller timeout only bounds the
+    /// wait for the acknowledgement; the supervisor keeps processing the
+    /// command and retains ownership if the helper reports uncertainty.
+    pub(crate) fn reload(&self, rules: String, timeout: Duration) -> Result<(), String> {
+        if self.state() != DnsSessionState::Running {
+            return Err(format!(
+                "DNS rule reload requires a running session (state {:?})",
+                self.state()
+            ));
+        }
+        let (reply, result) = mpsc::sync_channel(1);
+        if self
+            .command
+            .send(SupervisorCommand::Reload { rules, reply })
+            .is_err()
+        {
+            return self.state.error().map_or_else(
+                || Err("DNS session supervisor is unavailable".to_owned()),
+                Err,
+            );
+        }
+        match result.recv_timeout(timeout) {
+            Ok(result) => result,
+            Err(RecvTimeoutError::Timeout) => {
+                Err("DNS rule reload is still pending; the active session remains owned".to_owned())
+            }
+            Err(RecvTimeoutError::Disconnected) => self.state.error().map_or_else(
+                || Err("DNS session supervisor stopped unexpectedly".to_owned()),
+                Err,
+            ),
+        }
     }
 
     /// Request ordered shutdown and wait at most `timeout` for completion.
@@ -720,6 +757,33 @@ fn run_supervisor(
                 }
                 stop_requested = true;
                 stop_deadline.get_or_insert_with(|| Instant::now() + INTERNAL_STOP_TIMEOUT);
+            }
+            Ok(SupervisorCommand::Reload { rules, reply }) => {
+                if stop_requested || state.load() != DnsSessionState::Running {
+                    let _ = reply.send(Err(format!(
+                        "DNS rule reload requires a running session (state {:?})",
+                        state.load()
+                    )));
+                    continue;
+                }
+                match manager.reload_transparent(rules) {
+                    Ok(_) => {
+                        let _ = reply.send(Ok(()));
+                    }
+                    Err(TransparentReloadError::Rejected(error)) => {
+                        // The companion kept its previous engine. The
+                        // session remains Running and may accept another
+                        // reload or route new flows.
+                        let _ = reply.send(Err(error));
+                    }
+                    Err(TransparentReloadError::Uncertain(error)) => {
+                        remember_error(&mut first_error, error.clone());
+                        state.fail(error.clone());
+                        let _ = reply.send(Err(error));
+                        stop_requested = true;
+                        stop_deadline.get_or_insert_with(|| Instant::now() + INTERNAL_STOP_TIMEOUT);
+                    }
+                }
             }
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
@@ -1157,6 +1221,103 @@ mod tests {
             let _socket = std::net::TcpListener::bind(endpoint)
                 .expect("TCP reservation released after worker exit");
         }
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    #[ignore = "real unelevated helper only; no WinDivert handle, driver, or DNS settings"]
+    fn supervisor_reload_preserves_rejected_rules_and_stops_after_reload() {
+        let directory =
+            std::env::temp_dir().join(format!("vapour-dns-session-reload-{}", std::process::id()));
+        fs::create_dir(&directory).expect("create a fresh owned test directory");
+        let manager = Arc::new(DnsProcessManager::new(directory.clone()));
+        let initial = manager
+            .start_transparent(TransparentDnsConfig {
+                listen_addresses: vec!["127.0.0.1".into()],
+                listen_port: 0,
+                rules: "||old.example.test^".into(),
+            })
+            .expect("real transparent companion should start");
+        let router = PacketRouter::new(&initial).expect("ready status should build router");
+        let (events, event_receiver) = mpsc::channel();
+        let state = Arc::new(SessionState::new());
+        state.store(DnsSessionState::Running);
+        let core = Arc::new(SessionCore {
+            handles: Mutex::new(Vec::new()),
+            manager: Arc::clone(&manager),
+            router: Mutex::new(router),
+            state: Arc::clone(&state),
+            events,
+            clock: Instant::now(),
+            drain_enabled: AtomicBool::new(false),
+            finish_without_drain: AtomicBool::new(false),
+            shutdown_complete: Mutex::new(Vec::new()),
+        });
+        let (commands, command_receiver) = mpsc::channel();
+        let supervisor_core = Arc::clone(&core);
+        let supervisor_manager = Arc::clone(&manager);
+        let supervisor_state = Arc::clone(&state);
+        let supervisor = thread::spawn(move || {
+            run_supervisor(
+                supervisor_core,
+                supervisor_manager,
+                Vec::new(),
+                Vec::new(),
+                command_receiver,
+                event_receiver,
+                supervisor_state,
+            )
+        });
+        let session = DnsSession {
+            command: commands,
+            state,
+            supervisor: Some(supervisor),
+        };
+
+        session
+            .reload(
+                "||new.example.test^\n||second.example.test^".into(),
+                Duration::from_secs(12),
+            )
+            .expect("valid reload should be acknowledged");
+        let updated = manager
+            .status()
+            .expect("status after accepted reload")
+            .expect("transparent helper remains active");
+        assert_eq!(updated.udp_addr, initial.udp_addr);
+        assert_eq!(updated.tcp_addr, initial.tcp_addr);
+        assert_eq!(updated.rules_count, 2);
+
+        let rejected = session
+            .reload(
+                "192.0.2.1 arbitrary.example.test".into(),
+                Duration::from_secs(12),
+            )
+            .expect_err("invalid replacement must be rejected");
+        assert!(rejected.contains("rejected rule reload"));
+        assert_eq!(
+            manager
+                .status()
+                .expect("status after rejected reload")
+                .expect("helper remains active"),
+            updated
+        );
+        assert_eq!(session.state(), DnsSessionState::Running);
+
+        session
+            .stop(Duration::from_secs(3))
+            .expect("reload session should stop cleanly");
+        assert!(manager
+            .status()
+            .expect("status after session stop")
+            .is_none());
+        let refusal = session
+            .reload(
+                "||after-stop.example.test^".into(),
+                Duration::from_millis(50),
+            )
+            .expect_err("reload after stop must be refused");
+        assert!(refusal.contains("requires a running session"));
         let _ = fs::remove_dir_all(directory);
     }
 }

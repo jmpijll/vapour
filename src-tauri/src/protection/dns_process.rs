@@ -189,6 +189,15 @@ enum ReloadFailure {
     Uncertain(String),
 }
 
+/// Typed outcome for a transparent live reload. A rejection is an ordinary
+/// rule-validation failure and leaves the active generation usable; an
+/// uncertain outcome means the owner must close interception before stopping
+/// the retained companion.
+pub(crate) enum TransparentReloadError {
+    Rejected(String),
+    Uncertain(String),
+}
+
 enum StartSpec {
     Legacy(DnsProcessConfig),
     Transparent(TransparentDnsConfig),
@@ -454,6 +463,48 @@ impl DnsProcessManager {
                     terminate_and_reap(&mut running);
                 }
                 Err(error)
+            }
+        }
+    }
+
+    /// Reload a transparent companion while preserving the distinction
+    /// between a structured rule rejection and an uncertain control channel.
+    /// The latter retains the child and its reserved ports until the session
+    /// owner closes interception and explicitly stops this manager.
+    pub(crate) fn reload_transparent(
+        &self,
+        rules: String,
+    ) -> Result<DnsProcessStatus, TransparentReloadError> {
+        let command = encode_reload_command(&rules).map_err(TransparentReloadError::Rejected)?;
+        let mut slot = self.running.lock().map_err(|_| {
+            TransparentReloadError::Uncertain("DNS process state is poisoned".into())
+        })?;
+        if let Err(error) = require_active(slot.as_ref()) {
+            return Err(TransparentReloadError::Uncertain(error));
+        }
+        let mut running = slot.take().ok_or_else(|| {
+            TransparentReloadError::Uncertain("DNS proxy is not running".to_owned())
+        })?;
+        if !running.is_transparent() {
+            *slot = Some(running);
+            return Err(TransparentReloadError::Uncertain(
+                "transparent reload requires a transparent DNS companion".to_owned(),
+            ));
+        }
+
+        match running.reload(command) {
+            Ok(status) => {
+                *slot = Some(running);
+                Ok(status)
+            }
+            Err(ReloadFailure::Rejected(error)) => {
+                *slot = Some(running);
+                Err(TransparentReloadError::Rejected(error))
+            }
+            Err(ReloadFailure::Uncertain(error)) => {
+                running.control = ControlState::Uncertain;
+                *slot = Some(running);
+                Err(TransparentReloadError::Uncertain(error))
             }
         }
     }
@@ -3094,8 +3145,14 @@ mod tests {
         let issue = |manager: &DnsProcessManager| match operation {
             "register" => manager.register_flow(flow.clone()).map(|()| ()),
             "reload" => manager
-                .reload("||uncertain.example.test^".to_owned())
-                .map(|_| ()),
+                .reload_transparent("||uncertain.example.test^".to_owned())
+                .map(|_| ())
+                .map_err(|error| match error {
+                    TransparentReloadError::Uncertain(error) => error,
+                    TransparentReloadError::Rejected(error) => {
+                        panic!("uncertain control response was classified as a rule rejection: {error}")
+                    }
+                }),
             _ => panic!("unsupported transparent control operation {operation}"),
         };
         assert!(

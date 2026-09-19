@@ -174,6 +174,14 @@ until that worker exits and that its terminal failure remains observable.
 An indefinitely stuck native worker still retains the helper; this is incomplete
 cleanup, not a successful stop.
 
+Live reload is now serialized with stop by that supervisor. A real unelevated
+test replaces one rule with two, verifies rejected replacement preserves the
+active rule count and listeners, and checks that reload after stop is refused.
+Malformed/timeout control tests verify a typed uncertain outcome while socket
+ownership is retained. Such uncertainty requests ordered session cleanup;
+ordinary rule rejection leaves the session running. A caller timeout means
+reload is pending, not that its rules were rolled back.
+
 These checks do not establish end-to-end protection. The driver-backed session
 tests are prepared in [DNS-NATIVE-TESTS.md](DNS-NATIVE-TESTS.md) but have not run.
 Remaining work includes session rollover, topology changes, native failure

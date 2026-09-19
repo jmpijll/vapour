@@ -266,6 +266,31 @@ fn native_session_case(local: &str, resolver: &str) {
         !server.unexpected.load(Ordering::Acquire),
         "blocked query reached the resolver"
     );
+    session
+        .0
+        .reload(
+            "||blocked.example.test^\n||allowed.example.test^".into(),
+            Duration::from_secs(12),
+        )
+        .expect("reload rules without replacing the interception session");
+    for tcp in [false, true] {
+        let blocked = exchange(local, resolver, tcp, "allowed.example.test");
+        assert_eq!(
+            blocked[3] & 15,
+            3,
+            "new rules must affect existing resolver slots"
+        );
+    }
+    assert_eq!(server.seen.load(Ordering::Acquire), 2);
+    session
+        .0
+        .reload("||blocked.example.test^".into(), Duration::from_secs(12))
+        .expect("restore original rules in the same session");
+    for tcp in [false, true] {
+        let allowed = exchange(local, resolver, tcp, "allowed.example.test");
+        assert_eq!(allowed[3] & 15, 0);
+    }
+    assert_eq!(server.seen.load(Ordering::Acquire), 4);
     let started = Instant::now();
     session
         .0
@@ -276,7 +301,7 @@ fn native_session_case(local: &str, resolver: &str) {
         let direct = exchange(local, resolver, tcp, "direct.blocked.example.test");
         assert_eq!(direct[3] & 15, 0);
     }
-    assert_eq!(server.seen.load(Ordering::Acquire), 4);
+    assert_eq!(server.seen.load(Ordering::Acquire), 6);
     assert!(!server.unexpected.load(Ordering::Acquire));
     drop(session);
     drop(server);

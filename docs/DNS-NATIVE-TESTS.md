@@ -27,9 +27,11 @@ Each session test must prove all of the following:
   fixture resolver.
 - An allowed query reaches that resolver and returns through the original
   resolver/client tuple.
+- Reloading rules blocks the previously allowed name over UDP and TCP without
+  replacing the session. Restoring the rules permits it again.
 - Session stop finishes within its deadline.
 - After stop, a subdomain of the blocked rule reaches the resolver normally
-  over both transports. The server sees exactly four forwarded requests total.
+  over both transports. The server sees exactly six forwarded requests total.
 
 The fixture requests bounded cleanup during assertion unwinding as well. A
 cleanup error is a failure, not a passed test. Retained workers/driver handles
