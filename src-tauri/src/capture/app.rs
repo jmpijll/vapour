@@ -157,37 +157,7 @@ use std::{
 };
 
 pub fn stage(directory: &Path) -> Result<PathBuf, String> {
-    // Embedded versioned files; never resolve DLLs via PATH or the working directory.
-    let directory = directory.join("windivert-2.2.2-A-x64");
-    fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
-    for (name, bytes) in [
-        (
-            "WinDivert.dll",
-            include_bytes!("../../vendor/windivert/WinDivert.dll").as_slice(),
-        ),
-        (
-            "WinDivert64.sys",
-            include_bytes!("../../vendor/windivert/WinDivert64.sys").as_slice(),
-        ),
-        (
-            "LICENSE",
-            include_bytes!("../../vendor/windivert/LICENSE").as_slice(),
-        ),
-    ] {
-        let path = directory.join(name);
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(mut f) => {
-                f.write_all(bytes).map_err(|e| e.to_string())?;
-                f.sync_all().map_err(|e| e.to_string())?;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(e.to_string()),
-        }
-        if fs::read(&path).map_err(|e| e.to_string())? != bytes {
-            return Err("Capture runtime integrity check failed".into());
-        }
-    }
-    Ok(directory.join("WinDivert.dll"))
+    super::runtime_stage::stage(directory)
 }
 
 pub fn resolve(pid: u32, expected_path: &str) -> Result<Identity, String> {

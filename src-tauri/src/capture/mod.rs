@@ -7,6 +7,7 @@ mod packet;
 mod attribution;
 mod generation;
 mod raw;
+mod runtime_stage;
 mod app;
 mod windivert;
 use parking_lot::Mutex;
@@ -21,6 +22,10 @@ use std::{
 };
 
 pub const MAX_BYTES: u64 = 64 * 1024 * 1024;
+/// Stage and verify the bundled driver without opening a capture handle.
+pub(crate) fn stage_divert_runtime(directory: &std::path::Path) -> Result<PathBuf, String> {
+    app::stage(directory)
+}
 pub const MAX_SECONDS: u64 = 60;
 static NEXT_RUN: AtomicU64 = AtomicU64::new(1);
 #[derive(Clone, Debug, Serialize)]
