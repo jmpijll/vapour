@@ -88,9 +88,17 @@ func (r *serviceRuntime) start(input config) (statusMessage, error) {
 	if validated.DualStack {
 		listenerCount = 2
 	}
+	if validated.Transparent {
+		listenerCount = len(validated.ListenAddresses)
+	}
 	if len(udpAddrs) != listenerCount || len(tcpAddrs) != listenerCount {
 		_ = service.shutdown()
 		return statusMessage{}, errors.New("DNS proxy started without the expected listener addresses")
+	}
+	if validated.Transparent {
+		if err := validateTransparentReady(validated, udpAddrs, tcpAddrs, service.slotStatus()); err != nil {
+			return statusMessage{}, errors.Join(err, service.shutdown())
+		}
 	}
 
 	r.service = service
@@ -102,6 +110,7 @@ func (r *serviceRuntime) start(input config) (statusMessage, error) {
 		UDPAddrs:   udpAddrs,
 		TCPAddrs:   tcpAddrs,
 		RulesCount: engine.rulesCount(),
+		Slots:      service.slotStatus(),
 	}, nil
 }
 
@@ -136,6 +145,30 @@ func runProtocol(input io.Reader, output io.Writer) error {
 		}
 
 		switch request.Op {
+		case "register", "release":
+			var commandErr error
+			if runtime.service == nil || request.Flow == nil {
+				commandErr = errors.New("flow command requires a running service and flow")
+			} else if request.Op == "register" {
+				commandErr = runtime.service.registerFlow(*request.Flow)
+			} else {
+				commandErr = runtime.service.releaseFlow(*request.Flow)
+			}
+			if commandErr != nil {
+				if err := writeError(sink, commandErr); err != nil {
+					_ = runtime.stop()
+					return err
+				}
+				continue
+			}
+			status := "registered"
+			if request.Op == "release" {
+				status = "released"
+			}
+			if err := sink.write(statusMessage{Status: status}); err != nil {
+				_ = runtime.stop()
+				return err
+			}
 		case "start":
 			if request.Config == nil {
 				if err := writeError(sink, errors.New("start requires config")); err != nil {
@@ -232,6 +265,9 @@ func runConfigFile(path string, input io.Reader, output io.Writer) error {
 		return err
 	}
 	requested, err := decodeConfig(data)
+	if err == nil && requested.Transparent {
+		err = errors.New("transparent DNS requires the command protocol for flow registration")
+	}
 	if err != nil {
 		if writeErr := writeError(sink, err); writeErr != nil {
 			return writeErr

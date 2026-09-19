@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -40,27 +41,31 @@ const (
 // the OS for an ephemeral port, which is useful for tests.  Production may
 // set 53; the process does not elevate itself or change system DNS settings.
 type config struct {
-	Upstream      string `json:"upstream"`
-	ListenAddress string `json:"listen_address,omitempty"`
-	ListenPort    int    `json:"listen_port,omitempty"`
-	DualStack     bool   `json:"dual_stack,omitempty"`
-	Rules         string `json:"rules,omitempty"`
+	Transparent     bool     `json:"transparent,omitempty"`
+	ListenAddresses []string `json:"listen_addresses,omitempty"`
+	Upstream        string   `json:"upstream"`
+	ListenAddress   string   `json:"listen_address,omitempty"`
+	ListenPort      int      `json:"listen_port,omitempty"`
+	DualStack       bool     `json:"dual_stack,omitempty"`
+	Rules           string   `json:"rules,omitempty"`
 }
 
 type command struct {
-	Op     string  `json:"op"`
-	Config *config `json:"config,omitempty"`
-	Rules  *string `json:"rules,omitempty"`
+	Op     string            `json:"op"`
+	Config *config           `json:"config,omitempty"`
+	Rules  *string           `json:"rules,omitempty"`
+	Flow   *flowRegistration `json:"flow,omitempty"`
 }
 
 type statusMessage struct {
-	Status     string   `json:"status"`
-	Error      string   `json:"error,omitempty"`
-	UDPAddr    string   `json:"udp_addr,omitempty"`
-	TCPAddr    string   `json:"tcp_addr,omitempty"`
-	UDPAddrs   []string `json:"udp_addrs,omitempty"`
-	TCPAddrs   []string `json:"tcp_addrs,omitempty"`
-	RulesCount uint64   `json:"rules_count,omitempty"`
+	Status     string               `json:"status"`
+	Error      string               `json:"error,omitempty"`
+	UDPAddr    string               `json:"udp_addr,omitempty"`
+	TCPAddr    string               `json:"tcp_addr,omitempty"`
+	UDPAddrs   []string             `json:"udp_addrs,omitempty"`
+	TCPAddrs   []string             `json:"tcp_addrs,omitempty"`
+	RulesCount uint64               `json:"rules_count,omitempty"`
+	Slots      []upstreamSlotStatus `json:"slots,omitempty"`
 }
 
 // domainDecision is intentionally small because the command protocol only
@@ -213,6 +218,12 @@ func validateUpstreamAddress(address string) error {
 }
 
 func validateConfig(input config) (config, error) {
+	if input.Transparent {
+		return validateTransparentConfig(input)
+	}
+	if len(input.ListenAddresses) != 0 {
+		return config{}, fmt.Errorf("listen_addresses requires transparent mode")
+	}
 	input.Upstream = strings.TrimSpace(input.Upstream)
 	if err := validateUpstreamAddress(input.Upstream); err != nil {
 		return config{}, err
@@ -242,22 +253,40 @@ func validateConfig(input config) (config, error) {
 }
 
 type dnsService struct {
-	proxy  *dnsproxy.Proxy
-	engine atomic.Pointer[domainEngine]
+	proxy       *dnsproxy.Proxy
+	engine      atomic.Pointer[domainEngine]
+	flows       *authorizedFlows
+	slots       []*flowUpstream
+	transparent *transparentListeners
 }
 
 func newDNSService(cfg config, engine *domainEngine) (*dnsService, error) {
+	if cfg.Transparent {
+		validated, err := validateTransparentConfig(cfg)
+		if err != nil {
+			return nil, err
+		}
+		cfg = validated
+	}
 	if engine == nil || engine.dns == nil {
 		return nil, fmt.Errorf("domain engine is required")
 	}
-	if err := validateUpstreamAddress(cfg.Upstream); err != nil {
-		return nil, err
+	if !cfg.Transparent {
+		if err := validateUpstreamAddress(cfg.Upstream); err != nil {
+			return nil, err
+		}
 	}
 
-	upstreams, err := dnsproxy.ParseUpstreamsConfig(
-		[]string{"udp://" + cfg.Upstream},
-		&upstream.Options{Timeout: 2 * time.Second},
-	)
+	var upstreams *dnsproxy.UpstreamConfig
+	var err error
+	if cfg.Transparent {
+		upstreams = &dnsproxy.UpstreamConfig{Upstreams: []upstream.Upstream{rejectingUpstream{}}}
+	} else {
+		upstreams, err = dnsproxy.ParseUpstreamsConfig(
+			[]string{"udp://" + cfg.Upstream},
+			&upstream.Options{Timeout: 2 * time.Second},
+		)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("parse explicit DNS upstream: %w", err)
 	}
@@ -265,21 +294,49 @@ func newDNSService(cfg config, engine *domainEngine) (*dnsService, error) {
 	if cfg.DualStack {
 		listenIPs = []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")}
 	}
+	if cfg.Transparent {
+		listenIPs = nil
+		for _, address := range cfg.ListenAddresses {
+			parsed := netip.MustParseAddr(address)
+			listenIPs = append(listenIPs, net.IP(parsed.AsSlice()))
+		}
+	}
 	udpListenAddrs := make([]*net.UDPAddr, 0, len(listenIPs))
 	tcpListenAddrs := make([]*net.TCPAddr, 0, len(listenIPs))
-	for _, listenIP := range listenIPs {
-		udpListenAddrs = append(udpListenAddrs, &net.UDPAddr{IP: listenIP, Port: cfg.ListenPort})
-		tcpListenAddrs = append(tcpListenAddrs, &net.TCPAddr{IP: listenIP, Port: cfg.ListenPort})
+	for i, listenIP := range listenIPs {
+		zone := ""
+		if cfg.Transparent {
+			zone = netip.MustParseAddr(cfg.ListenAddresses[i]).Zone()
+		}
+		udpListenAddrs = append(udpListenAddrs, &net.UDPAddr{IP: listenIP, Port: cfg.ListenPort, Zone: zone})
+		tcpListenAddrs = append(tcpListenAddrs, &net.TCPAddr{IP: listenIP, Port: cfg.ListenPort, Zone: zone})
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	service := &dnsService{}
 	service.engine.Store(engine)
+	if cfg.Transparent {
+		service.flows = newAuthorizedFlows(4096)
+		for _, address := range cfg.ListenAddresses {
+			for range 8 {
+				slot, reserveErr := reserveFlowUpstream(netip.MustParseAddr(address), 2*time.Second)
+				if reserveErr != nil {
+					return nil, errors.Join(reserveErr, service.closeSlots())
+				}
+				service.slots = append(service.slots, slot)
+			}
+		}
+	}
+	proxyUDP, proxyTCP := udpListenAddrs, tcpListenAddrs
+	if cfg.Transparent {
+		proxyUDP = []*net.UDPAddr{}
+		proxyTCP = []*net.TCPAddr{}
+	}
 	server, err := dnsproxy.New(&dnsproxy.Config{
 		Logger:         logger,
-		UDPListenAddr:  udpListenAddrs,
-		TCPListenAddr:  tcpListenAddrs,
+		UDPListenAddr:  proxyUDP,
+		TCPListenAddr:  proxyTCP,
 		UpstreamConfig: upstreams,
-		RequestHandler: filteringHandler{engine: &service.engine},
+		RequestHandler: filteringHandler{engine: &service.engine, flows: service.flows},
 		CacheEnabled:   false,
 		DNSSECEnabled:  false,
 		RefuseAny:      true,
@@ -287,10 +344,16 @@ func newDNSService(cfg config, engine *domainEngine) (*dnsService, error) {
 		UDPBufferSize:  2048,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("create DNS proxy: %w", err)
+		return nil, errors.Join(fmt.Errorf("create DNS proxy: %w", err), service.closeSlots())
 	}
 
 	service.proxy = server
+	if cfg.Transparent {
+		service.transparent, err = newTransparentListeners(service, udpListenAddrs, tcpListenAddrs)
+		if err != nil {
+			return nil, errors.Join(err, service.closeSlots())
+		}
+	}
 	return service, nil
 }
 
@@ -301,16 +364,26 @@ func (s *dnsService) start() error {
 	if err := s.proxy.Start(context.Background()); err != nil {
 		return fmt.Errorf("start DNS proxy: %w", err)
 	}
+	if s.transparent != nil {
+		return s.transparent.Start()
+	}
 	return nil
 }
 
-func (s *dnsService) shutdown() error {
-	if s == nil || s.proxy == nil {
+func (s *dnsService) shutdown() (err error) {
+	if s == nil {
+		return nil
+	}
+	defer func() { err = errors.Join(err, s.closeSlots()) }()
+	if s.proxy == nil {
 		return nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
-	return s.proxy.Shutdown(ctx)
+	if s.transparent != nil {
+		err = s.transparent.Shutdown(ctx)
+	}
+	return errors.Join(err, s.proxy.Shutdown(ctx))
 }
 
 func (s *dnsService) udpAddr() string {
@@ -330,6 +403,9 @@ func (s *dnsService) tcpAddr() string {
 }
 
 func (s *dnsService) udpAddrs() []string {
+	if s != nil && s.transparent != nil {
+		return s.transparent.UDPAddrs()
+	}
 	if s == nil || s.proxy == nil {
 		return nil
 	}
@@ -344,6 +420,9 @@ func (s *dnsService) udpAddrs() []string {
 }
 
 func (s *dnsService) tcpAddrs() []string {
+	if s != nil && s.transparent != nil {
+		return s.transparent.TCPAddrs()
+	}
 	if s == nil || s.proxy == nil {
 		return nil
 	}
@@ -359,6 +438,7 @@ func (s *dnsService) tcpAddrs() []string {
 
 type filteringHandler struct {
 	engine *atomic.Pointer[domainEngine]
+	flows  *authorizedFlows
 }
 
 func (h filteringHandler) ServeDNS(
@@ -366,6 +446,28 @@ func (h filteringHandler) ServeDNS(
 	server *dnsproxy.Proxy,
 	dctx *dnsproxy.DNSContext,
 ) error {
+	if h.flows != nil {
+		if dctx.Conn == nil {
+			return dnsproxy.ErrDrop
+		}
+		local, err := netip.ParseAddrPort(dctx.Conn.LocalAddr().String())
+		if err != nil {
+			return dnsproxy.ErrDrop
+		}
+		local, err = canonicalEndpoint(local)
+		if err != nil {
+			return dnsproxy.ErrDrop
+		}
+		peer, err := canonicalEndpoint(dctx.Addr)
+		if err != nil {
+			return dnsproxy.ErrDrop
+		}
+		route, ok := h.flows.Lookup(flowKey{Protocol: string(dctx.Proto), Peer: peer, Local: local}, time.Now())
+		if !ok {
+			return dnsproxy.ErrDrop
+		}
+		dctx.CustomUpstreamConfig = dnsproxy.NewCustomUpstreamConfig(&dnsproxy.UpstreamConfig{Upstreams: []upstream.Upstream{borrowedUpstream{route}}}, false, 0, false)
+	}
 	engine := h.engine.Load()
 	for _, question := range dctx.Req.Question {
 		if engine.decideQuestion(question.Name, question.Qtype).Blocked {

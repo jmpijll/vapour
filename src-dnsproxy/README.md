@@ -18,6 +18,28 @@ The process never changes system DNS settings, installs a driver, changes
 Windows Firewall state, elevates itself, or logs DNS queries.  The caller owns
 any later Windows resolver routing and rollback policy.
 
+## Transparent transport (internal Windows mode)
+
+The command protocol also supports `transparent: true` with an explicit
+`listen_addresses` array. This mode has no default resolver. It reserves eight
+UDP/TCP upstream socket pairs per local address before reporting `ready`; the
+`slots` array identifies every owned source endpoint. Listeners bind individual
+addresses, not wildcards, so a reflected packet's destination remains known.
+
+The parent must register a reflected `protocol`, `peer`, `local`, original
+`resolver`, upstream `slot` and `lifetime_ms` before delivering a packet. A
+resolver must match the reflected peer's IP at port 53. `register` replies
+`registered`; `release` replies `released`. Unknown flows are dropped before
+DNS validation or domain filtering. A released or expired tuple cannot be
+registered again in the same session.
+
+Each upstream slot keeps its source ports owned until the service stops. A slot
+cannot change resolver or transport after assignment. UDP truncation falls back
+to its reserved TCP socket; failed TCP connections remain reserved but unusable.
+The parent must stop interception before asking the companion to stop. The
+Windows controller, session rollover and real driver reflection are still being
+integrated; this mode does not enable adblocking in the app by itself.
+
 ## Build and run
 
 From this directory in PowerShell:

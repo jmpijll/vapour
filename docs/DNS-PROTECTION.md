@@ -108,15 +108,24 @@ The next implementation follows the
 [transparent routing plan](superpowers/plans/2026-09-15-transparent-dns.md):
 intercept conventional UDP/TCP port 53 traffic with a separate active WinDivert
 handle and retain the original resolver destination selected by Windows. The
-companion needs authenticated per-flow routing and owned upstream sockets before
-this can replace its current fixed-upstream test configuration. Adapter DNS
+companion now has an internal command mode for exact per-flow routing and owned
+upstream sockets. The Rust controller still needs to connect that mode to packet
+interception before it can replace the fixed-upstream test configuration. Adapter DNS
 settings remain unchanged in this design. The existing configuration journal
 and watchdog are groundwork for the alternative adapter-rewrite approach; they
 must not be enabled alongside transparent interception.
 
+The internal mode prebinds exclusive UDP/TCP upstream ports and reports them
+with its explicit IPv4/IPv6 listeners. Only parent-registered transport tuples
+can reach DNS parsing and filtering. Resolver assignments cannot be retargeted;
+expired and released tuples remain quarantined until the session ends. Failed
+TCP connections retain their reserved socket until interception can be stopped.
+Local tests use synthetic endpoints and do not change adapter DNS settings.
+
 These checks do not establish end-to-end protection. Remaining work includes
-bounded packet/flow reflection, dual-stack listeners and forwarding, prevention
-of recursive interception, helper/driver failure recovery, graceful shutdown,
+connecting the bounded packet/flow reflection to these listeners, installing
+the exact owned-port exclusions, session rollover, helper/driver failure recovery,
+graceful shutdown,
 restart, periodic updates and the UI switch. Native tests must verify that
 adapter settings stay unchanged and that cleanup restores ordinary packet flow.
 VPN, NRPT and per-application routing still need explicit verification: retaining
