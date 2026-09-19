@@ -377,22 +377,23 @@ func assertAAAA(t *testing.T, response *dns.Msg, want string) {
 type syntheticUpstream struct {
 	udpServer *dns.Server
 	tcpServer *dns.Server
-	udpConn   *net.UDPConn
-	tcpConn   *net.TCPListener
+	udpConn   net.PacketConn
+	tcpConn   net.Listener
 	queries   int32
 }
 
 func startSyntheticUpstream(t *testing.T) *syntheticUpstream {
 	t.Helper()
-	udpConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	tcpConn, udpConn, err := bindSyntheticUpstreamPair(
+		func(network string, address *net.TCPAddr) (net.Listener, error) {
+			return net.ListenTCP(network, address)
+		},
+		func(network string, address *net.UDPAddr) (net.PacketConn, error) {
+			return net.ListenUDP(network, address)
+		},
+	)
 	if err != nil {
-		t.Fatalf("ListenUDP: %v", err)
-	}
-	port := udpConn.LocalAddr().(*net.UDPAddr).Port
-	tcpConn, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: port})
-	if err != nil {
-		_ = udpConn.Close()
-		t.Fatalf("ListenTCP: %v", err)
+		t.Fatalf("bind synthetic upstream listeners: %v", err)
 	}
 
 	upstream := &syntheticUpstream{udpConn: udpConn, tcpConn: tcpConn}
@@ -430,4 +431,36 @@ func startSyntheticUpstream(t *testing.T) *syntheticUpstream {
 
 func (s *syntheticUpstream) address() string {
 	return fmt.Sprintf("127.0.0.1:%d", s.udpConn.LocalAddr().(*net.UDPAddr).Port)
+}
+
+const syntheticUpstreamBindAttempts = 32
+
+func bindSyntheticUpstreamPair(
+	listenTCP func(string, *net.TCPAddr) (net.Listener, error),
+	listenUDP func(string, *net.UDPAddr) (net.PacketConn, error),
+) (net.Listener, net.PacketConn, error) {
+	var lastErr error
+	for attempt := 0; attempt < syntheticUpstreamBindAttempts; attempt++ {
+		tcpListener, err := listenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+		if err != nil {
+			lastErr = fmt.Errorf("listen TCP: %w", err)
+			continue
+		}
+
+		tcpAddress, ok := tcpListener.Addr().(*net.TCPAddr)
+		if !ok {
+			_ = tcpListener.Close()
+			lastErr = fmt.Errorf("TCP listener address has type %T, want *net.TCPAddr", tcpListener.Addr())
+			continue
+		}
+
+		udpConn, err := listenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: tcpAddress.Port})
+		if err == nil {
+			return tcpListener, udpConn, nil
+		}
+		_ = tcpListener.Close()
+		lastErr = fmt.Errorf("listen UDP on TCP port %d: %w", tcpAddress.Port, err)
+	}
+
+	return nil, nil, fmt.Errorf("bind TCP/UDP listener pair after %d attempts: %w", syntheticUpstreamBindAttempts, lastErr)
 }
