@@ -11,6 +11,14 @@ the filtering companion.
   fragments, IPv6 extension headers, IPv4 source routes and malformed options.
   IPv6 scope metadata belongs to the later routing layer, not the wire codec.
   This module does not intercept traffic or authorize a flow.
+- A bounded flow registry reflects requests and restores registered reverse
+  replies, retaining the original resolver and interface. It rejects ambiguous
+  reflected tuples across interfaces. Expired keys are quarantined until the
+  registry is dropped; continuous operation still requires a rollover policy.
+- A separate active WinDivert wrapper owns its DLL and handle, validates packet
+  bounds, checks injection counts and supports draining shutdown. It is not
+  started by the app. The isolated native forwarding probe remains unexecuted;
+  the current checks exercise its API through a fake driver.
 - The source-built companion listens on loopback and accepts an explicit numeric
   upstream. Rust verifies the embedded executable and supervises its lifetime.
 - An elevated caller launches the companion with the desktop user's primary
@@ -54,9 +62,10 @@ the filtering companion.
 Eleven packet-codec tests cover all four address-family/transport combinations,
 payload and TCP-header preservation, independent checksum assertions, computed
 UDP-zero encoding, every truncated fixture prefix, trailing bytes, malformed
-lengths/options, fragments and unsupported extensions. The combined Rust suite
-passes 232 tests, with 27 native/environment tests explicitly ignored. No active
-driver forwarding is exercised by these codec tests.
+lengths/options, fragments and unsupported extensions. Flow tests additionally
+cover reverse-tuple ownership, retry reuse, cross-interface collisions,
+quarantined expiry, capacity and TCP close grace. No active driver forwarding
+is exercised by these tests.
 
 Real companion tests cover initial filtering, live reload, invalid-replacement
 preservation and separate parser validation. Hidden-process watchdog tests cover

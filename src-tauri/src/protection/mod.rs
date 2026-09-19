@@ -2,6 +2,8 @@ pub mod cache;
 pub mod controller;
 pub mod dns_cache;
 pub mod dns_configuration;
+pub(crate) mod dns_divert;
+pub(crate) mod dns_flow;
 pub(crate) mod dns_packet;
 pub mod dns_process;
 pub mod dns_storage;

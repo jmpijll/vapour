@@ -14,9 +14,17 @@ tests because a new proxy socket can have different process/compartment policy.
 
 ## Implementation increments
 
-The pure packet codec in `src-tauri/src/protection/dns_packet.rs` is implemented
-and passes eleven unit tests. It performs no interception. Flow mapping,
-reply ownership, driver forwarding and companion integration below remain open.
+The pure packet codec and bounded flow registry are implemented. The registry
+restores only registered reverse tuples and retains the original interface
+metadata. Expired keys remain quarantined for the registry lifetime; the
+production controller still needs a rollover policy before this can run
+continuously.
+
+The separate active driver wrapper now owns receive, reinjection, checksum and
+shutdown APIs. Its unit tests use a fake API. An ignored native probe covers
+isolated loopback TCP/UDP over both families and traffic after handle closure;
+that probe has not been run. Companion integration and real packet reflection
+remain outstanding. None of this groundwork enables system interception.
 
 1. Implement a pure IPv4/IPv6 packet reflection and mapping module. Retain the
    original local address, resolver address, interface, transport and ports.
