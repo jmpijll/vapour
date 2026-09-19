@@ -10,7 +10,8 @@ if (Test-Path -LiteralPath $Destination) { throw 'Review destination must not al
 $revision = & git -C $repo rev-parse HEAD
 if ($LASTEXITCODE -ne 0) { throw 'Cannot identify source revision' }
 $dirty = & git -C $repo status --porcelain --untracked-files=normal
-if ($LASTEXITCODE -ne 0 -or $dirty) { throw 'Package only a clean checkout so the source archive matches the build' }
+if ($LASTEXITCODE -ne 0) { throw 'Cannot inspect source checkout' }
+if ($dirty) { throw "Package only a clean checkout so the source archive matches the build:`n$($dirty -join "`n")" }
 $directory = New-Item -ItemType Directory -Path $Destination
 Copy-Item -LiteralPath $binary.FullName -Destination (Join-Path $directory.FullName 'Vapour.exe')
 foreach ($name in @('LICENSE', 'THIRD_PARTY.md')) {
