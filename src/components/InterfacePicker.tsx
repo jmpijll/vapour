@@ -50,7 +50,7 @@ export function InterfacePicker({
             const next =
               e.key === "Home"
                 ? 0
-                : e.key === "End"
+                : e.key === "End" || (index < 0 && e.key === "ArrowUp")
                   ? buttons.length - 1
                   : (index + (e.key === "ArrowUp" ? -1 : 1) + buttons.length) %
                     buttons.length;

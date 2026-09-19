@@ -8,6 +8,8 @@ not a signed installer. `build.json` identifies the source revision and hashes;
 ## Review checklist
 
 - Open and hide the tray window. Try light/dark appearance and Basic/Advanced.
+- Open the interface menu with ArrowUp/ArrowDown; Escape should return focus
+  to its button. Check that appearance preferences survive a restart.
 - Compare interface traffic, link details and application activity. App
   measurements ask for administrator access; choose Not now to defer it.
 - Open an application, inspect destinations and check recently closed sessions.

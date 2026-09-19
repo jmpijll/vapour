@@ -31,4 +31,12 @@
 
 ## Completion
 
+Frontend evidence (2026-09-19): seven Edge preview tests pass at 360×760.
+They cover keyboard interface selection/Escape focus, destination tag visibility,
+Basic/Advanced persistence in light/dark, driver/IP/routes/counters and unavailable
+Wi-Fi presentation, theme/icon/interface preferences after reload, and the
+simulated app block → Firewall → unblock flow. A regression test first reproduced
+incorrect ArrowUp focus, then passed after the correction. These are browser
+presentation checks; they do not establish native enforcement or telemetry accuracy.
+
 Every checkbox requires evidence (commit, test output or live observation). Retain unresolved items and external platform/signing constraints; do not shrink the goal to the completed subset.
