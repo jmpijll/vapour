@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -194,6 +195,9 @@ func runProtocol(input io.Reader, output io.Writer) error {
 			var engine *domainEngine
 			if runtime.service == nil {
 				reloadErr = errors.New("DNS service is not running")
+			} else if reloadErr = runtime.service.rejectWhenQuiescing(); reloadErr != nil {
+				// A quiesced transparent service retains its engine and sockets;
+				// it cannot accept a new rule generation until the next start.
 			} else if request.Rules == nil {
 				reloadErr = errors.New("reload requires rules")
 			} else {
@@ -211,6 +215,26 @@ func runProtocol(input io.Reader, output io.Writer) error {
 			runtime.service.engine.Store(engine)
 			runtime.engine = engine
 			if err := sink.write(statusMessage{Status: "updated", RulesCount: engine.rulesCount()}); err != nil {
+				_ = runtime.stop()
+				return err
+			}
+		case "quiesce":
+			var quiesceErr error
+			if runtime.service == nil {
+				quiesceErr = errors.New("DNS service is not running")
+			} else {
+				ctx, cancel := context.WithTimeout(context.Background(), transparentQuiesceTimeout)
+				quiesceErr = runtime.service.quiesce(ctx)
+				cancel()
+			}
+			if quiesceErr != nil {
+				if err := writeError(sink, quiesceErr); err != nil {
+					_ = runtime.stop()
+					return err
+				}
+				continue
+			}
+			if err := sink.write(statusMessage{Status: "quiesced"}); err != nil {
 				_ = runtime.stop()
 				return err
 			}

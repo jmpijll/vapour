@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -137,6 +138,9 @@ func (r flowRegistration) key() (flowKey, error) {
 	return flowKey{Protocol: r.Protocol, Peer: peer, Local: local}, nil
 }
 func (s *dnsService) registerFlow(r flowRegistration) error {
+	if err := s.rejectWhenQuiescing(); err != nil {
+		return err
+	}
 	if s.flows == nil {
 		return errors.New("service is not in transparent mode")
 	}
@@ -189,6 +193,20 @@ func (s *dnsService) registerFlow(r flowRegistration) error {
 		}
 	}
 	return s.flows.registerPrepared(key, s.slots[r.Slot], time.Duration(r.LifetimeMS)*time.Millisecond, time.Now(), func() error { return s.slots[r.Slot].Assign(resolver, r.Protocol == "tcp") })
+}
+
+func (s *dnsService) quiesce(ctx context.Context) error {
+	if s == nil || s.transparent == nil {
+		return errors.New("transparent DNS service is not running")
+	}
+	return s.transparent.Quiesce(ctx)
+}
+
+func (s *dnsService) rejectWhenQuiescing() error {
+	if s == nil || s.transparent == nil {
+		return nil
+	}
+	return s.transparent.rejectWhenQuiescing()
 }
 
 // Winsock may report a named IPv6 zone while the parent supplies its numeric

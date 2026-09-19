@@ -52,6 +52,7 @@ const MAX_COMMAND_BYTES: usize = 2 * MAX_RULE_TEXT_BYTES + 64 * 1024;
 const MAX_STATUS_LINE_BYTES: usize = 64 * 1024;
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
 const FLOW_TIMEOUT: Duration = Duration::from_secs(2);
+const QUIESCE_TIMEOUT: Duration = Duration::from_secs(6);
 const STOP_TIMEOUT: Duration = Duration::from_secs(3);
 const READER_CLEANUP_TIMEOUT: Duration = Duration::from_millis(250);
 const READER_POLL_INTERVAL: Duration = Duration::from_millis(5);
@@ -263,6 +264,13 @@ impl ManagedChild {
     fn kill(&self) {}
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Quiescence {
+    Active,
+    Quiesced,
+    Uncertain,
+}
+
 struct Running {
     child: ManagedChild,
     stdin: Option<File>,
@@ -273,6 +281,8 @@ struct Running {
     _engine_file: File,
     job: ChildJob,
     status: Option<DnsProcessStatus>,
+    quiescence: Quiescence,
+    quiesce_writer: Option<JoinHandle<io::Result<()>>>,
 }
 
 /// Owns at most one loopback DNS companion process.
@@ -311,6 +321,7 @@ impl DnsProcessManager {
             .running
             .lock()
             .map_err(|_| "DNS process state is poisoned".to_owned())?;
+        require_active(slot.as_ref())?;
         let stale = match slot.as_mut() {
             None => false,
             Some(running) => match running.child.try_wait() {
@@ -364,8 +375,13 @@ impl DnsProcessManager {
             Ok(None) => Ok(slot.as_ref().and_then(|running| running.status.clone())),
             Ok(Some(exit)) => {
                 let message = format!("DNS proxy stopped unexpectedly ({})", exit);
-                let dead = slot.take();
-                drop(dead);
+                if slot
+                    .as_ref()
+                    .is_some_and(|running| running.quiescence == Quiescence::Active)
+                {
+                    let dead = slot.take();
+                    drop(dead);
+                }
                 Err(message)
             }
             Err(error) => Err(format!("cannot inspect DNS proxy: {error}")),
@@ -397,6 +413,7 @@ impl DnsProcessManager {
             .running
             .lock()
             .map_err(|_| "DNS process state is poisoned".to_owned())?;
+        require_active(slot.as_ref())?;
         let mut running = slot
             .take()
             .ok_or_else(|| "DNS proxy is not running".to_owned())?;
@@ -439,6 +456,7 @@ impl DnsProcessManager {
             .running
             .lock()
             .map_err(|_| "DNS process state is poisoned".to_owned())?;
+        require_active(slot.as_ref())?;
         let mut running = slot
             .take()
             .ok_or_else(|| "DNS proxy is not running".to_owned())?;
@@ -456,6 +474,46 @@ impl DnsProcessManager {
                 terminate_and_reap(&mut running);
                 Err(error)
             }
+        }
+    }
+
+    /// Stop admission while retaining the child and its socket reservations.
+    /// On any uncertainty the owner must close interception before calling
+    /// stop. In particular, this path must not use the terminating pipe writer.
+    pub(crate) fn quiesce(&self) -> Result<(), String> {
+        let mut slot = self
+            .running
+            .lock()
+            .map_err(|_| "DNS process state is poisoned")?;
+        let running = slot.as_mut().ok_or("DNS proxy is not running")?;
+        match running.quiescence {
+            Quiescence::Quiesced => return Ok(()),
+            Quiescence::Uncertain => {
+                return Err(
+                    "DNS quiescence is uncertain; stop interception before stopping the companion"
+                        .into(),
+                )
+            }
+            Quiescence::Active => {}
+        }
+        if running
+            .status
+            .as_ref()
+            .is_none_or(|status| status.slots.is_empty())
+        {
+            return Err("quiesce requires a transparent DNS companion".into());
+        }
+        running.quiescence = Quiescence::Uncertain;
+        let deadline = Instant::now() + QUIESCE_TIMEOUT;
+        let result = running.write_quiesce(deadline).and_then(|()| {
+            running.wait_command_ack("quiesce", "quiesced", deadline, QUIESCE_TIMEOUT)
+        });
+        match result {
+            Ok(()) => {
+                running.quiescence = Quiescence::Quiesced;
+                Ok(())
+            }
+            Err(ReloadFailure::Rejected(error) | ReloadFailure::Uncertain(error)) => Err(error),
         }
     }
 
@@ -480,6 +538,13 @@ impl DnsProcessManager {
         validator.stop()?;
         Ok(status.rules_count)
     }
+}
+
+fn require_active(running: Option<&Running>) -> Result<(), String> {
+    if running.is_some_and(|running| running.quiescence != Quiescence::Active) {
+        return Err("DNS companion is quiescing or quiesced".into());
+    }
+    Ok(())
 }
 
 impl Drop for DnsProcessManager {
@@ -574,6 +639,8 @@ impl Running {
                 _engine_file: engine.file,
                 job,
                 status: None,
+                quiescence: Quiescence::Active,
+                quiesce_writer: None,
             };
 
             let stdin = running
@@ -781,12 +848,61 @@ impl Running {
         } else {
             "released"
         };
+        self.wait_command_ack(operation, expected, deadline, FLOW_TIMEOUT)
+    }
+
+    fn write_quiesce(&mut self, deadline: Instant) -> Result<(), ReloadFailure> {
+        let mut writer = self
+            .stdin
+            .as_ref()
+            .ok_or_else(|| ReloadFailure::Uncertain("DNS proxy stdin is unavailable".into()))?
+            .try_clone()
+            .map_err(|error| {
+                ReloadFailure::Uncertain(format!("cannot retain DNS command pipe: {error}"))
+            })?;
+        let (sender, receiver) = mpsc::sync_channel(1);
+        // The original stdin stays in Running even if this worker fails or
+        // times out. Closing only the clone cannot send EOF to the companion.
+        let worker = thread::Builder::new()
+            .name("vapour-dns-quiesce".into())
+            .spawn(move || {
+                let result = writer
+                    .write_all(b"{\"op\":\"quiesce\"}\n")
+                    .and_then(|()| writer.flush());
+                drop(writer);
+                let _ = sender.send(result.map_err(|error| error.to_string()));
+                Ok(())
+            })
+            .map_err(|error| {
+                ReloadFailure::Uncertain(format!("cannot start DNS quiesce writer: {error}"))
+            })?;
+        self.quiesce_writer = Some(worker);
+        match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(result) => {
+                join_worker_bounded(self.quiesce_writer.take().expect("quiesce writer present"));
+                result.map_err(|error| {
+                    ReloadFailure::Uncertain(format!("DNS quiesce write failed: {error}"))
+                })
+            }
+            Err(error) => Err(ReloadFailure::Uncertain(format!(
+                "DNS quiesce write is uncertain: {error}"
+            ))),
+        }
+    }
+
+    fn wait_command_ack(
+        &mut self,
+        operation: &str,
+        expected: &str,
+        deadline: Instant,
+        timeout: Duration,
+    ) -> Result<(), ReloadFailure> {
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err(ReloadFailure::Uncertain(format!(
                     "DNS proxy {operation} flow command did not respond within {} seconds",
-                    FLOW_TIMEOUT.as_secs()
+                    timeout.as_secs()
                 )));
             }
 
@@ -1839,6 +1955,12 @@ fn validate_updated_status(status: &WireStatus) -> Result<(), String> {
 }
 
 fn stop_running(mut running: Running, send_stop: bool) -> Result<(), String> {
+    // The owner has now closed interception. Never race a timed-out writer
+    // with a second command on the same byte stream.
+    if running.quiesce_writer.is_some() {
+        terminate_and_reap(&mut running);
+        return Ok(());
+    }
     let mut first_error = None;
     let deadline = Instant::now() + STOP_TIMEOUT;
     if send_stop {
@@ -2185,6 +2307,9 @@ impl Drop for Running {
     fn drop(&mut self) {
         force_terminate(self);
         cleanup_reader(self, false);
+        if let Some(worker) = self.quiesce_writer.take() {
+            join_worker_bounded(worker);
+        }
     }
 }
 
@@ -2845,6 +2970,318 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    #[ignore = "real unelevated helper and local sockets only; no interception or DNS settings"]
+    fn quiesce_retains_ports_until_explicit_stop() {
+        let path = test_directory("quiesce-retention");
+        let manager = DnsProcessManager::new(path.clone());
+        let status = manager
+            .start_transparent(TransparentDnsConfig {
+                listen_addresses: vec!["127.0.0.1".into()],
+                listen_port: 0,
+                rules: "||blocked.example.test^".into(),
+            })
+            .unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        client.connect(&status.udp_addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let flow = TransparentFlowRegistration {
+            protocol: "udp".into(),
+            peer: client.local_addr().unwrap().to_string(),
+            local: status.udp_addr.clone(),
+            resolver: "127.0.0.1:53".into(),
+            slot: 0,
+            lifetime_ms: 120_000,
+        };
+        manager.register_flow(flow.clone()).unwrap();
+        let query = dns_query("blocked.example.test", 1);
+        client.send(&query).unwrap();
+        let mut response = [0; 512];
+        let n = client.recv(&mut response).unwrap();
+        assert_eq!(response_rcode(&response[..n]), 3);
+        let mut tcp = std::net::TcpStream::connect(&status.tcp_addr).unwrap();
+        tcp.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        manager.quiesce().unwrap();
+        manager.quiesce().unwrap();
+        assert!(manager.register_flow(flow.clone()).is_err());
+        assert!(manager.release_flow(flow).is_err());
+        assert!(manager.reload(String::new()).is_err());
+        assert!(manager.status().unwrap().is_some());
+        assert_ports_reserved(&status);
+        client
+            .set_read_timeout(Some(Duration::from_millis(250)))
+            .unwrap();
+        client.send(&query).unwrap();
+        assert!(client.recv(&mut response).is_err());
+        match tcp.read(&mut response) {
+            Ok(0) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::ConnectionAborted
+                        | io::ErrorKind::BrokenPipe
+                ) => {}
+            other => panic!("active TCP connection did not stop at the barrier: {other:?}"),
+        }
+        manager.stop().unwrap();
+        assert!(manager.status().unwrap().is_none());
+        assert_ports_released(&status);
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "real unelevated helper with injected acknowledgement failure; no driver"]
+    fn quiesce_uncertainty_preserves_child_and_reserved_ports() {
+        for malformed in [true, false] {
+            let path = test_directory("quiesce-uncertain");
+            let manager = DnsProcessManager::new(path.clone());
+            let status = manager
+                .start_transparent(TransparentDnsConfig {
+                    listen_addresses: vec!["127.0.0.1".into()],
+                    listen_port: 0,
+                    rules: String::new(),
+                })
+                .unwrap();
+            let (sender, injected) = mpsc::sync_channel(1);
+            if malformed {
+                sender
+                    .send(ReaderEvent::Line(
+                        br#"{"status":"quiesced","rules_count":1}"#.to_vec(),
+                    ))
+                    .unwrap();
+            }
+            let actual = {
+                let mut state = manager.running.lock().unwrap();
+                std::mem::replace(&mut state.as_mut().unwrap().events, injected)
+            };
+            assert!(manager.quiesce().is_err());
+            assert!(manager.quiesce().is_err());
+            assert!(manager.reload(String::new()).is_err());
+            assert!(manager.status().unwrap().is_some());
+            assert_ports_reserved(&status);
+            // Consume the genuine acknowledgement before restoring the stream.
+            let event = actual.recv_timeout(QUIESCE_TIMEOUT).unwrap();
+            let ReaderEvent::Line(line) = event else {
+                panic!("missing real quiesce acknowledgement")
+            };
+            let ack = parse_wire_status(&line).unwrap();
+            assert_eq!(ack.status, "quiesced");
+            validate_empty_status(&ack, "quiesce").unwrap();
+            {
+                let mut state = manager.running.lock().unwrap();
+                state.as_mut().unwrap().events = actual;
+            }
+            drop(sender);
+            manager.stop().unwrap();
+            assert_ports_released(&status);
+            let _ = fs::remove_dir_all(path);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "real unelevated helper killed deliberately; no driver or system settings"]
+    fn quiesce_child_exit_requires_explicit_owner_cleanup() {
+        let path = test_directory("quiesce-child-exit");
+        let manager = DnsProcessManager::new(path.clone());
+        let config = TransparentDnsConfig {
+            listen_addresses: vec!["127.0.0.1".into()],
+            listen_port: 0,
+            rules: String::new(),
+        };
+        manager.start_transparent(config.clone()).unwrap();
+        manager.quiesce().unwrap();
+        {
+            let mut state = manager.running.lock().unwrap();
+            let running = state.as_mut().unwrap();
+            assert!(running.quiesce_writer.is_none());
+            // Model death after an uncertain control outcome. The OS releases
+            // sockets on death, but health polling must not replace the owner.
+            running.quiescence = Quiescence::Uncertain;
+            terminate_and_reap(running);
+        }
+        assert!(manager.status().is_err());
+        assert!(manager.running.lock().unwrap().is_some());
+        assert!(manager.start_transparent(config.clone()).is_err());
+        assert!(manager.running.lock().unwrap().is_some());
+        let _ = manager.stop();
+        assert!(manager.running.lock().unwrap().is_none());
+        manager.start_transparent(config).unwrap();
+        manager.stop().unwrap();
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "real unelevated helper and anonymous pipes only; no driver or system settings"]
+    fn stop_with_pending_quiesce_writer_does_not_send_a_second_command() {
+        let path = test_directory("quiesce-pending-writer");
+        let manager = DnsProcessManager::new(path.clone());
+        manager
+            .start_transparent(TransparentDnsConfig {
+                listen_addresses: vec!["127.0.0.1".into()],
+                listen_port: 0,
+                rules: String::new(),
+            })
+            .expect("real transparent companion should start unelevated");
+
+        // Keep a duplicate of the parent's real stdin writer alive while
+        // replacing the manager's writer with a private pipe. If
+        // stop_running accidentally sends a second command, the private
+        // reader below observes it.
+        let (stop_reader, stop_writer) = anonymous_pipe().expect("stop-observation pipe");
+        let mut stop_reader = unsafe { File::from_raw_handle(stop_reader.into_raw_handle()) };
+        let stop_writer = unsafe { File::from_raw_handle(stop_writer.into_raw_handle()) };
+        let original_stdin = {
+            let mut state = manager.running.lock().unwrap();
+            let running = state.as_mut().expect("running transparent companion");
+            let original = running
+                .stdin
+                .as_ref()
+                .expect("companion stdin")
+                .try_clone()
+                .expect("clone companion stdin");
+            running.stdin = Some(stop_writer);
+            original
+        };
+
+        // A large synchronous write to an unread anonymous pipe remains
+        // pending. The drainer is released only when explicit stop begins,
+        // allowing Running::Drop to join the pending writer in its bounded
+        // cleanup window instead of detaching it.
+        let (writer_read, writer_write) = anonymous_pipe().expect("writer pipe");
+        let writer_read = unsafe { File::from_raw_handle(writer_read.into_raw_handle()) };
+        let mut writer = unsafe { File::from_raw_handle(writer_write.into_raw_handle()) };
+        let writer_started = Arc::new(AtomicBool::new(false));
+        let writer_completed = Arc::new(AtomicBool::new(false));
+        let drain_requested = Arc::new(AtomicBool::new(false));
+        let writer_started_thread = Arc::clone(&writer_started);
+        let writer_completed_thread = Arc::clone(&writer_completed);
+        let writer_worker = thread::spawn(move || {
+            writer_started_thread.store(true, Ordering::Release);
+            let result = writer.write_all(&vec![0x5a; 1024 * 1024]);
+            writer_completed_thread.store(true, Ordering::Release);
+            result
+        });
+        while !writer_started.load(Ordering::Acquire) {
+            thread::yield_now();
+        }
+        thread::sleep(Duration::from_millis(50));
+        if writer_worker.is_finished() {
+            let _ = writer_worker.join();
+            panic!("test writer unexpectedly completed before stop");
+        }
+
+        let drain_requested_thread = Arc::clone(&drain_requested);
+        let drainer = thread::spawn(move || {
+            while !drain_requested_thread.load(Ordering::Acquire) {
+                thread::sleep(READER_POLL_INTERVAL);
+            }
+            let mut reader = writer_read;
+            let mut buffer = [0u8; 8192];
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) => return Ok::<(), io::Error>(()),
+                    Ok(_) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        });
+
+        {
+            let mut state = manager.running.lock().unwrap();
+            let running = state.as_mut().expect("running transparent companion");
+            running.quiescence = Quiescence::Uncertain;
+            running.quiesce_writer = Some(writer_worker);
+        }
+        drain_requested.store(true, Ordering::Release);
+        let stop_started = Instant::now();
+        let stop_result = manager.stop();
+        let stop_elapsed = stop_started.elapsed();
+        let drain_result = drainer.join();
+        let writer_completed = writer_completed.load(Ordering::Acquire);
+
+        // Closing the manager's private writer at stop completion makes this
+        // read return EOF. Any stop command would instead be observable here.
+        drop(original_stdin);
+        let mut observed = Vec::new();
+        stop_reader
+            .read_to_end(&mut observed)
+            .expect("read stop-observation pipe");
+
+        assert!(
+            stop_result.is_ok(),
+            "pending-writer stop failed: {stop_result:?}"
+        );
+        assert!(
+            drain_result.is_ok(),
+            "writer drainer failed: {drain_result:?}"
+        );
+        assert!(
+            writer_completed,
+            "pending writer did not complete before cleanup returned"
+        );
+        assert!(
+            stop_elapsed < STOP_TIMEOUT,
+            "pending-writer stop exceeded its bounded cleanup window: {stop_elapsed:?}"
+        );
+        assert!(
+            observed.is_empty(),
+            "stop wrote a second command while quiesce writer was pending: {observed:?}"
+        );
+        assert!(manager.running.lock().unwrap().is_none());
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[cfg(windows)]
+    fn assert_ports_reserved(status: &DnsProcessStatus) {
+        for address in status
+            .udp_addrs
+            .iter()
+            .chain(status.slots.iter().map(|slot| &slot.udp_addr))
+        {
+            assert!(
+                UdpSocket::bind(address).is_err(),
+                "reserved UDP port was released"
+            );
+        }
+        for address in status
+            .tcp_addrs
+            .iter()
+            .chain(status.slots.iter().map(|slot| &slot.tcp_addr))
+        {
+            assert!(
+                std::net::TcpListener::bind(address).is_err(),
+                "reserved TCP port was released"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    fn assert_ports_released(status: &DnsProcessStatus) {
+        for address in status
+            .udp_addrs
+            .iter()
+            .chain(status.slots.iter().map(|slot| &slot.udp_addr))
+        {
+            let _bound =
+                UdpSocket::bind(address).expect("UDP endpoint should be released after stop");
+        }
+        for address in status
+            .tcp_addrs
+            .iter()
+            .chain(status.slots.iter().map(|slot| &slot.tcp_addr))
+        {
+            let _bound = std::net::TcpListener::bind(address)
+                .expect("TCP endpoint should be released after stop");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
     #[ignore = "requires the real unelevated transparent companion; no DNS or system settings are changed"]
     fn starts_real_transparent_companion_registers_and_releases_flow() {
         let path = test_directory("transparent-start");
@@ -3137,6 +3574,8 @@ mod tests {
             _engine_file: engine.file,
             job,
             status: None,
+            quiescence: Quiescence::Active,
+            quiesce_writer: None,
         };
         let command = encode_start_command(&config(upstream.local_addr().unwrap()))
             .expect("encode demoted start command");

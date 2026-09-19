@@ -19,6 +19,7 @@ import (
 const (
 	transparentListenerTimeout = 2 * time.Second
 	transparentStartupTimeout  = 5 * time.Second
+	transparentQuiesceTimeout  = 5 * time.Second
 	transparentMaxTCPConns     = 64
 	transparentMaxHandlers     = 64
 )
@@ -26,6 +27,7 @@ const (
 var (
 	errTransparentUnauthorized = errors.New("transparent DNS flow is not authorized")
 	errTransparentStopped      = errors.New("transparent DNS listeners are stopped")
+	errTransparentQuiesced     = errors.New("transparent DNS listeners are quiesced")
 )
 
 // transparentListeners owns the sockets used in transparent mode.  The
@@ -50,6 +52,8 @@ type transparentListeners struct {
 	handlerGate     chan struct{}
 	handlerWG       sync.WaitGroup
 	handlerStopping bool
+	quiescing       bool
+	quiesced        bool
 
 	stateMu  sync.Mutex
 	starting bool
@@ -147,7 +151,7 @@ func newTransparentListeners(
 			ReadTimeout:  transparentListenerTimeout,
 			WriteTimeout: transparentListenerTimeout,
 			DecorateReader: func(reader dns.Reader) dns.Reader {
-				return &transparentReader{Reader: reader, flows: service.flows, proto: dnsproxy.ProtoUDP, buffer: make([]byte, dns.MaxMsgSize)}
+				return &transparentReader{listeners: l, Reader: reader, flows: service.flows, proto: dnsproxy.ProtoUDP, buffer: make([]byte, dns.MaxMsgSize)}
 			},
 		}
 		l.installRunnerNotify(runner)
@@ -162,7 +166,7 @@ func newTransparentListeners(
 			ReadTimeout:  transparentListenerTimeout,
 			WriteTimeout: transparentListenerTimeout,
 			DecorateReader: func(reader dns.Reader) dns.Reader {
-				return &transparentReader{Reader: reader, flows: service.flows, proto: dnsproxy.ProtoTCP}
+				return &transparentReader{listeners: l, Reader: reader, flows: service.flows, proto: dnsproxy.ProtoTCP}
 			},
 		}
 		l.installRunnerNotify(runner)
@@ -251,6 +255,80 @@ func (l *transparentListeners) failStart(startErr error) error {
 	return errors.Join(startErr, l.Shutdown(ctx))
 }
 
+// Quiesce stops admitting new transparent DNS work and waits for handlers
+// already admitted at the barrier to finish. It deliberately leaves every
+// listener and upstream reservation open; Shutdown remains the sole owner of
+// those sockets. The barrier covers user-space handlers and aborts accepted
+// TCP views with SetLinger(0) where the connection supports it, but cannot by
+// itself prove that a kernel has delivered no final TCP packet. Native
+// end-to-end quiescence is a later controller concern.
+func (l *transparentListeners) Quiesce(ctx context.Context) error {
+	if l == nil {
+		return errors.New("transparent DNS listeners are nil")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	l.stateMu.Lock()
+	closed := l.closed
+	started := l.started
+	l.stateMu.Unlock()
+	if closed {
+		return errTransparentStopped
+	}
+	if !started {
+		return errors.New("transparent DNS listeners are not started")
+	}
+
+	l.handlerMu.Lock()
+	if l.quiesced {
+		l.handlerMu.Unlock()
+		return nil
+	}
+	// Keep handlerStopping set even when the caller's deadline expires. This
+	// fails closed while preserving the sockets for a later retry or stop.
+	l.quiescing = true
+	l.handlerStopping = true
+	l.handlerMu.Unlock()
+
+	var closeErr error
+	for _, listener := range l.tcpListeners {
+		closeErr = errors.Join(closeErr, listener.quiesceConnections())
+	}
+	waitErr := l.waitForHandlers(ctx)
+	if closeErr != nil || waitErr != nil {
+		return errors.Join(closeErr, waitErr)
+	}
+
+	l.stateMu.Lock()
+	closed = l.closed
+	l.stateMu.Unlock()
+	if closed {
+		return errTransparentStopped
+	}
+	l.handlerMu.Lock()
+	l.quiesced = true
+	l.handlerMu.Unlock()
+	return nil
+}
+
+func (l *transparentListeners) isQuiescing() bool {
+	if l == nil {
+		return false
+	}
+	l.handlerMu.Lock()
+	defer l.handlerMu.Unlock()
+	return l.quiescing || l.handlerStopping
+}
+
+func (l *transparentListeners) rejectWhenQuiescing() error {
+	if l != nil && l.isQuiescing() {
+		return errTransparentQuiesced
+	}
+	return nil
+}
+
 // Shutdown stops all servers, closes active TCP connections, and releases the
 // original sockets.  It is idempotent and safe to call before Start.
 func (l *transparentListeners) Shutdown(ctx context.Context) error {
@@ -335,6 +413,26 @@ func (l *transparentListeners) waitForServeAndHandlers(ctx context.Context) erro
 	}
 }
 
+func (l *transparentListeners) waitForHandlers(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	done := make(chan struct{})
+	go func() {
+		l.handlerWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 func (l *transparentListeners) closeBound() error {
 	l.boundCloseOnce.Do(func() {
 		var err error
@@ -374,6 +472,7 @@ func (l *transparentListeners) TCPAddrs() []string {
 // still raw.  In particular, unknown UDP packets are consumed and skipped
 // before miekg/dns can generate FORMERR or validate a question.
 type transparentReader struct {
+	listeners *transparentListeners
 	dns.Reader
 	flows  *authorizedFlows
 	proto  dnsproxy.Proto
@@ -385,6 +484,9 @@ func (r *transparentReader) ReadUDP(conn *net.UDPConn, timeout time.Duration) ([
 		packet, session, err := r.Reader.ReadUDP(conn, timeout)
 		if err != nil {
 			return nil, nil, err
+		}
+		if r.isQuiescing() {
+			continue
 		}
 		key, err := transparentFlowKey(string(r.proto), conn.LocalAddr(), session.RemoteAddr())
 		if err == nil {
@@ -404,6 +506,9 @@ func (r *transparentReader) ReadPacketConn(conn net.PacketConn, timeout time.Dur
 		if err != nil {
 			return nil, nil, err
 		}
+		if r.isQuiescing() {
+			continue
+		}
 		key, err := transparentFlowKey(string(r.proto), conn.LocalAddr(), peerAddr)
 		if err != nil {
 			continue
@@ -418,9 +523,15 @@ func (r *transparentReader) ReadPacketConn(conn net.PacketConn, timeout time.Dur
 }
 
 func (r *transparentReader) ReadTCP(conn net.Conn, timeout time.Duration) ([]byte, error) {
+	if r.isQuiescing() {
+		return nil, errTransparentQuiesced
+	}
 	packet, err := r.Reader.ReadTCP(conn, timeout)
 	if err != nil {
 		return nil, err
+	}
+	if r.isQuiescing() {
+		return nil, errTransparentQuiesced
 	}
 	key, keyErr := transparentFlowKey(string(r.proto), conn.LocalAddr(), conn.RemoteAddr())
 	if keyErr != nil {
@@ -430,6 +541,10 @@ func (r *transparentReader) ReadTCP(conn net.Conn, timeout time.Duration) ([]byt
 		return nil, errTransparentUnauthorized
 	}
 	return packet, nil
+}
+
+func (r *transparentReader) isQuiescing() bool {
+	return r.listeners != nil && r.listeners.isQuiescing()
 }
 
 // transparentPacketConn deliberately has a distinct dynamic type from
@@ -582,10 +697,11 @@ func (transparentContextConn) SetWriteDeadline(time.Time) error {
 type transparentTCPListener struct {
 	net.Listener
 
-	mu     sync.Mutex
-	slots  chan struct{}
-	conns  map[*transparentTCPConn]struct{}
-	closed bool
+	mu        sync.Mutex
+	slots     chan struct{}
+	conns     map[*transparentTCPConn]struct{}
+	closed    bool
+	quiescing bool
 }
 
 func newTransparentTCPListener(listener net.Listener) *transparentTCPListener {
@@ -609,6 +725,11 @@ func (l *transparentTCPListener) Accept() (net.Conn, error) {
 			_ = conn.Close()
 			return nil, net.ErrClosed
 		}
+		if l.quiescing {
+			l.mu.Unlock()
+			_ = transparentCloseError(transparentAbortiveClose(conn))
+			continue
+		}
 		select {
 		case l.slots <- struct{}{}:
 			wrapped := &transparentTCPConn{Conn: conn, owner: l}
@@ -620,6 +741,22 @@ func (l *transparentTCPListener) Accept() (net.Conn, error) {
 			_ = conn.Close()
 		}
 	}
+}
+
+func (l *transparentTCPListener) quiesceConnections() error {
+	l.mu.Lock()
+	l.quiescing = true
+	connections := make([]*transparentTCPConn, 0, len(l.conns))
+	for conn := range l.conns {
+		connections = append(connections, conn)
+	}
+	l.mu.Unlock()
+
+	var err error
+	for _, conn := range connections {
+		err = errors.Join(err, transparentCloseError(conn.abortiveClose()))
+	}
+	return err
 }
 
 func (l *transparentTCPListener) release(conn *transparentTCPConn) {
@@ -664,6 +801,26 @@ func (c *transparentTCPConn) Close() error {
 		c.owner.release(c)
 	})
 	return err
+}
+
+func (c *transparentTCPConn) abortiveClose() error {
+	var err error
+	c.once.Do(func() {
+		if linger, ok := c.Conn.(interface{ SetLinger(int) error }); ok {
+			err = errors.Join(err, linger.SetLinger(0))
+		}
+		err = errors.Join(err, c.Conn.Close())
+		c.owner.release(c)
+	})
+	return err
+}
+
+func transparentAbortiveClose(conn net.Conn) error {
+	var err error
+	if linger, ok := conn.(interface{ SetLinger(int) error }); ok {
+		err = errors.Join(err, linger.SetLinger(0))
+	}
+	return errors.Join(err, conn.Close())
 }
 
 func transparentUDPBinding(addr *net.UDPAddr) (network, address string, err error) {

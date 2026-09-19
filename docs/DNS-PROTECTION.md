@@ -141,10 +141,19 @@ registers a real local UDP client, receives a blocked response, releases that
 flow, verifies subsequent queries receive no response, and stops the process.
 No interception handle or system DNS changes are involved in this test.
 
+The companion now supports a separate quiesce command. It rejects new work,
+waits for admitted handlers and retains listener/upstream bindings until stop.
+The Rust owner also retains the process on missing or malformed quiesce replies;
+registration, reload and replacement remain disabled until explicit cleanup.
+Real unelevated integration tests verify port retention, silent UDP admission,
+active TCP closure, delayed/malformed acknowledgements and child-exit handling.
+This does not establish kernel packet silence: the runtime still needs to drain
+and close interception handles before it tells the companion to release ports.
+
 These checks do not establish end-to-end protection. Remaining work includes
 connecting the bounded packet/flow reflection to these listeners, installing
 the exact owned-port exclusions, session rollover, helper/driver failure recovery,
-graceful shutdown with a companion quiesce phase that retains reserved sockets,
+driver shutdown ordered after companion quiescence and before socket release,
 restart, periodic updates and the UI switch. Native tests must verify that
 adapter settings stay unchanged and that cleanup restores ordinary packet flow.
 VPN, NRPT and per-application routing still need explicit verification: retaining

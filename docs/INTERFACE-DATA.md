@@ -1,6 +1,6 @@
 # Interface data for Basic and Advanced
 
-The current page remains compact. Advanced presentation is future work; the data contract is prepared independently of its final layout.
+The Basic page remains compact. The global Advanced toggle reveals the collected adapter details, with unavailable and stale states preserved.
 
 ## Collected now
 
@@ -31,6 +31,14 @@ Future optional collectors should return a reason such as unsupported, disconnec
 ## Validation
 
 Unit tests cover unknown states, flag decoding and exact u64 counters. An explicit ignored native test (`live_adapter_metadata_serializes_without_elevation`) reads the real table and validates serialization without logging adapter identifiers. Browser builds remain compatible with demo snapshots that omit details.
+
+The Windows host's unelevated native probes pass for adapter serialization,
+IP configuration, routes, driver metadata and Wi-Fi availability. Companion
+TCP/UDP socket-table probes also identify locally created sockets. These checks
+do not mutate configuration or log network identifiers. Wi-Fi reports one
+disconnected interface and zero measured links, so connected signal/PHY values
+remain unverified. These are acquisition checks, not a full comparison against
+Windows settings or proof of sustained collection performance.
 
 ## References
 
