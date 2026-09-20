@@ -881,6 +881,7 @@ mod tests {
                     Err(error) => panic!("Test accept failed: {error}"),
                 }
             };
+            server.set_nonblocking(false).unwrap();
             for stream in [&client, &server] {
                 stream
                     .set_read_timeout(Some(Duration::from_secs(2)))
