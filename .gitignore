@@ -46,3 +46,8 @@ __pycache__/
 # Downloaded capture runtime (reproducible setup script)
 src-tauri/vendor/windivert/*.dll
 src-tauri/vendor/windivert/*.sys
+
+/test-results/
+/playwright-report/
+
+/.tmp-*/

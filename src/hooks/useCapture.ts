@@ -10,6 +10,8 @@ export type CaptureStatus = {
   active: boolean;
   finalizing: boolean;
   partial?: boolean;
+  native_loss_available?: boolean;
+  loss_details?: Record<string, number>;
   packets: number;
   bytes: number;
   dropped: number;

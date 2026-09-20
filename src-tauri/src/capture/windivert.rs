@@ -56,11 +56,19 @@ impl Reader {fn shutdown(&self){self.handle.shutdown();}
   Ok(())
  }}
 impl Drop for Reader {fn drop(&mut self){if self.worker.is_some(){let _=self.finish();}}}
-pub struct Collection {pub packets:Vec<(i64,Vec<u8>)>,pub events:Vec<Event>,pub qpc_frequency:u64,pub qpc_anchor:i64,pub filetime_anchor:i64}
+pub struct Collection {pub packets:Vec<(i64,Vec<u8>)>,pub events:Vec<Event>,pub udp_binds:Option<super::bind_snapshot::PriorBinds>,pub tcp_prior:Option<super::tcp_snapshot::PriorTcp>,pub qpc_frequency:u64,pub qpc_anchor:i64,pub filetime_anchor:i64}
 fn bounded_seconds(value:u64)->u64{value.clamp(1,60)}
-fn identity(pid:u32)->Option<Identity>{
+pub(super) fn identity(pid:u32)->Option<Identity>{
  use windows::Win32::{Foundation::{CloseHandle,FILETIME},System::Threading::*};
  unsafe{let h=OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,false,pid).ok()?;let(mut c,mut e,mut k,mut u)=(FILETIME::default(),FILETIME::default(),FILETIME::default(),FILETIME::default());let ok=GetProcessTimes(h,&mut c,&mut e,&mut k,&mut u).is_ok();let _=CloseHandle(h);ok.then_some(Identity{pid,creation_time_100ns:((c.dwHighDateTime as u64)<<32)|c.dwLowDateTime as u64})}
+}
+fn qpc_to_filetime(qpc:i64,anchor:i64,filetime:i64,frequency:u64)->Option<u64>{
+ if frequency==0{return None;}
+ let value=filetime as i128+(qpc as i128-anchor as i128)*10_000_000/frequency as i128;
+ u64::try_from(value).ok()
+}
+fn identity_is_valid_at(owner:Identity,event_qpc:i64,anchor:i64,filetime:i64,frequency:u64)->bool{
+ owner.creation_time_100ns!=0&&event_qpc>=0&&qpc_to_filetime(event_qpc,anchor,filetime,frequency).is_some_and(|event_time|owner.creation_time_100ns<=event_time)
 }
 fn ip(api:&Api,data:&[u8])->Option<IpAddr>{
  let mut words=[0u32;4];for(i,w)in words.iter_mut().enumerate(){*w=u32::from_ne_bytes(data.get(i*4..i*4+4)?.try_into().ok()?);}
@@ -68,21 +76,23 @@ fn ip(api:&Api,data:&[u8])->Option<IpAddr>{
  let value:IpAddr=unsafe{CStr::from_ptr(out.as_ptr())}.to_str().ok()?.parse().ok()?;
  Some(match value {IpAddr::V6(v)=>v.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(v)),other=>other})
 }
-fn event(api:&Api,address:Address,cache:&mut HashMap<(u64,u32),Identity>)->Option<Event>{
+fn event(api:&Api,address:Address,cache:&mut HashMap<(u64,u32),Identity>,anchor:i64,filetime:i64,frequency:u64)->Option<Event>{
  let layer=address.bits&255;let kind=match(layer,(address.bits>>8)&255){(2,1)=>EventKind::Established,(2,2)=>EventKind::Deleted,(3,4)=>EventKind::Connect,(3,6)=>EventKind::Accept,(3,7)=>EventKind::Close,_=>return None};
  let d=address.data;let endpoint=u64::from_ne_bytes(d[0..8].try_into().ok()?);let pid=u32::from_ne_bytes(d[16..20].try_into().ok()?);
  let local=SocketAddr::new(ip(api,&d[20..36])?,u16::from_ne_bytes(d[52..54].try_into().ok()?));
  let remote=SocketAddr::new(ip(api,&d[36..52])?,u16::from_ne_bytes(d[54..56].try_into().ok()?));
  if !matches!(d[56],6|17)||local.port()==0||remote.port()==0||local.ip().is_unspecified()||remote.ip().is_unspecified(){return None;}
- let current=identity(pid);
+ let current=identity(pid).filter(|owner|identity_is_valid_at(*owner,address.timestamp,anchor,filetime,frequency));
  // Only endpoint-bound closure evidence may use an identity recorded while alive.
- let owner=current.or_else(||matches!(kind,EventKind::Close|EventKind::Deleted).then(||cache.get(&(endpoint,pid)).copied()).flatten()).unwrap_or(Identity{pid,creation_time_100ns:0});
+ let owner=current.or_else(||matches!(kind,EventKind::Close|EventKind::Deleted).then(||cache.get(&(endpoint,pid)).copied()).flatten().filter(|owner|identity_is_valid_at(*owner,address.timestamp,anchor,filetime,frequency))).unwrap_or(Identity{pid,creation_time_100ns:0});
  if owner.creation_time_100ns!=0{cache.insert((endpoint,pid),owner);}
  Some(Event{timestamp_qpc:address.timestamp,endpoint_id:endpoint,owner,flow:Flow{protocol:d[56],local,remote},kind})
 }
-pub fn collect(dll:&Path,cancel:&AtomicBool,max_seconds:u64,ready:SyncSender<Result<(),String>>,diagnostics:&mut super::CaptureLossDetails)->Result<Collection,String>{
+pub fn collect(dll:&Path,cancel:&AtomicBool,max_seconds:u64,ready:SyncSender<Result<(),String>>,diagnostics:&mut super::CaptureLossDetails,mut observe:impl FnMut(&Event,u64)->Result<(),String>)->Result<Collection,String>{
  if BROKEN.load(Ordering::Acquire){return Err("Restart Vapour after the previous capture shutdown failure".into());}
  let api=Api::load(dll)?;let mut frequency=0;let mut anchor=0;let mut filetime=0u64;
+ let before_binds=super::bind_snapshot::Snapshot::read().ok();
+ let before_tcp=super::tcp_snapshot::Snapshot::read().ok();
  unsafe{if QueryPerformanceFrequency(&mut frequency)==0||frequency<=0||QueryPerformanceCounter(&mut anchor)==0{return Err("Capture clock unavailable".into());}GetSystemTimeAsFileTime(&mut filetime);}
  let(tx,rx)=mpsc::sync_channel(4096);let failed=Arc::new(AtomicBool::new(false));let budget=Arc::new(AtomicUsize::new(0));let packet_count=Arc::new(AtomicUsize::new(0));
  let queue_full=Arc::new(AtomicUsize::new(0));let size_limit=Arc::new(AtomicUsize::new(0));
@@ -112,11 +122,33 @@ pub fn collect(dll:&Path,cancel:&AtomicBool,max_seconds:u64,ready:SyncSender<Res
   }).map_err(|e|{unsafe{(api.close)(handle);}e.to_string()})?;
   readers.push(Reader{handle:native_handle,worker:Some(worker)});
  }
+ let udp_binds=before_binds.and_then(|before| {
+  let after=super::bind_snapshot::Snapshot::read().ok()?;
+  let mut ready_at=0;
+  if unsafe{QueryPerformanceCounter(&mut ready_at)}==0{return None;}
+  Some(super::bind_snapshot::PriorBinds::new(before,after,ready_at))
+ });
+ let tcp_prior=before_tcp.and_then(|before| {
+  let after=super::tcp_snapshot::Snapshot::read().ok()?;
+  let mut ready_at=0;
+  if unsafe{QueryPerformanceCounter(&mut ready_at)}==0{return None;}
+  super::tcp_snapshot::PriorTcp::new(before,after,ready_at).ok()
+ });
  drop(tx);let _=ready.send(Ok(()));
- let mut result=Collection{packets:Vec::new(),events:Vec::new(),qpc_frequency:frequency as u64,qpc_anchor:anchor,filetime_anchor:filetime as i64};let mut cache=HashMap::new();let started=Instant::now();
+ let mut result=Collection{packets:Vec::new(),events:Vec::new(),udp_binds,tcp_prior,qpc_frequency:frequency as u64,qpc_anchor:anchor,filetime_anchor:filetime as i64};let mut cache=HashMap::new();let started=Instant::now();let mut metadata_count=0usize;
  let mut receive=|message|->Result<(),String>{match message{Message::Packet(at,bytes)=>result.packets.push((at,bytes)),Message::Metadata(address)=>{
-  if result.events.len()>=20_000{return Err("Capture metadata limit reached".into());}
-  if let Some(e)=event(&api,address,&mut cache){result.events.push(e);}
+  metadata_count+=1;
+  if metadata_count>20_000{return Err("Capture metadata limit reached".into());}
+  if let Some((at,local))=bind_change(&api,&address){
+   if result.udp_binds.as_mut().is_some_and(|binds|!binds.observe(at,local)){return Err("Invalid UDP bind history".into());}
+  }
+  if let Some(e)=event(&api,address,&mut cache,anchor,filetime as i64,frequency as u64){
+   observe(&e,filetime)?;
+   if let Some(prior)=result.tcp_prior.as_mut(){prior.observe(&e);}
+   result.events.push(e);
+  }else if address.data[56]==6&&matches!((address.bits&255,(address.bits>>8)&255),(2,1|2)|(3,4|6|7)){
+   if let Some(prior)=result.tcp_prior.as_mut(){prior.invalidate_all(address.timestamp);}
+  }
  }}Ok(())};
  let mut processing_error=None;
  while !cancel.load(Ordering::Acquire)&&started.elapsed()<Duration::from_secs(bounded_seconds(max_seconds))&&!failed.load(Ordering::Acquire){
@@ -132,7 +164,17 @@ pub fn collect(dll:&Path,cancel:&AtomicBool,max_seconds:u64,ready:SyncSender<Res
  if failed.load(Ordering::Acquire){return Err("Capture lost data or reached its memory limit; recording discarded".into());}
  Ok(result)
 }
-#[cfg(test)]mod tests{#[test]fn max_seconds_is_bounded(){assert_eq!(super::bounded_seconds(90),60);assert_eq!(super::bounded_seconds(0),1);}#[test]fn address_abi_matches_native(){assert_eq!(std::mem::size_of::<super::Address>(),80);}}
+
+fn bind_change(api:&Api,address:&Address)->Option<(i64,Option<SocketAddr>)>{
+ let layer=address.bits&255;
+ let kind=(address.bits>>8)&255;
+ if layer!=3||!matches!(kind,3|7)||address.data[56]!=17{return None;}
+ let port=u16::from_ne_bytes(address.data[52..54].try_into().ok()?);
+ let local=if port==0{None}else{ip(api,&address.data[20..36]).map(|ip|SocketAddr::new(ip,port))};
+ // A malformed local address cannot be ignored as though no bind changed.
+ Some((address.timestamp,local))
+}
+#[cfg(test)]mod tests{use super::super::attribution::Identity;#[test]fn max_seconds_is_bounded(){assert_eq!(super::bounded_seconds(90),60);assert_eq!(super::bounded_seconds(0),1);}#[test]fn address_abi_matches_native(){assert_eq!(std::mem::size_of::<super::Address>(),80);}#[test]fn qpc_identity_check_rejects_a_pid_created_after_the_event(){let owner=Identity{pid:7,creation_time_100ns:999};assert!(super::identity_is_valid_at(owner,100,100,1_000,10_000_000));assert!(!super::identity_is_valid_at(owner,98,100,1_000,10_000_000));assert!(!super::identity_is_valid_at(Identity{creation_time_100ns:1_001,..owner},100,100,1_000,10_000_000));}}
 
 #[cfg(test)] mod lifecycle_tests {
  use super::*;
@@ -143,6 +185,15 @@ pub fn collect(dll:&Path,cancel:&AtomicBool,max_seconds:u64,ready:SyncSender<Res
  unsafe extern "C" fn close(_:Handle)->i32{CLOSES.fetch_add(1,Ordering::SeqCst);1}
  unsafe extern "C" fn param(_:Handle,_:i32,_:u64)->i32{1}
  unsafe extern "C" fn format(_:*const u32,_:*mut c_char,_:u32)->i32{0}
+ #[test] fn udp_bind_and_close_metadata_with_unreadable_address_invalidates_prior_evidence(){
+  let api=Api{module:0,open,recv,shutdown,close,param,format};
+  for kind in [3,7]{
+   let mut address=Address{timestamp:50,bits:3|(kind<<8),..Default::default()};
+   address.data[56]=17;address.data[52..54].copy_from_slice(&8000u16.to_ne_bytes());
+   assert_eq!(bind_change(&api,&address),Some((50,None)));
+   address.data[56]=6;assert_eq!(bind_change(&api,&address),None);
+  }
+ }
  #[test] fn stalled_worker_keeps_handle_alive_until_receive_exits(){
   CLOSES.store(0,Ordering::SeqCst);
   let api=Arc::new(Api{module:0,open,recv,shutdown,close,param,format});

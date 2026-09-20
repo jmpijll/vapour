@@ -1,11 +1,26 @@
+param([string]$RepositoryRoot)
 $ErrorActionPreference='Stop'
-$repository=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+$repository = if ([string]::IsNullOrWhiteSpace($RepositoryRoot)) {
+ [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+} else {
+ [IO.Path]::GetFullPath($RepositoryRoot)
+}
 $destination=Join-Path $repository 'src-tauri/vendor/windivert'
 $temporary=Join-Path ([IO.Path]::GetTempPath()) ('vapour-windivert-'+[guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $temporary | Out-Null
 try {
  $archive=Join-Path $temporary 'WinDivert.zip'
- Invoke-WebRequest -Uri 'https://github.com/basil00/WinDivert/releases/download/v2.2.2/WinDivert-2.2.2-A.zip' -OutFile $archive
+ $downloadUri='https://github.com/basil00/WinDivert/releases/download/v2.2.2/WinDivert-2.2.2-A.zip'
+ for($attempt=1; $attempt -le 3; $attempt++) {
+  if(Test-Path -LiteralPath $archive){Remove-Item -LiteralPath $archive -Force}
+  try {
+   Invoke-WebRequest -Uri $downloadUri -OutFile $archive -TimeoutSec 60 -UseBasicParsing
+   break
+  } catch {
+   if($attempt -eq 3){throw}
+   Start-Sleep -Seconds (2 * $attempt)
+  }
+ }
  if((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -ne '63CB41763BB4B20F600B6DE04E991A9C2BE73279E317D4D82F237B150C5F3F15'){throw 'WinDivert archive checksum mismatch'}
  Expand-Archive -LiteralPath $archive -DestinationPath $temporary
  $source=Join-Path $temporary 'WinDivert-2.2.2-A/x64'

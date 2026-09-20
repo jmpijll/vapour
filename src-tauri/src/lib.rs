@@ -8,6 +8,7 @@ use tauri::{
 
 pub mod firewall;
 pub mod network;
+pub mod protection;
 pub mod window;
 
 use firewall::FirewallManager;
@@ -21,6 +22,28 @@ pub struct AppState {
     pub latest: Mutex<Option<NetworkSnapshot>>,
     pub is_pinned: AtomicBool,
     pub tray: Mutex<Option<tauri::tray::TrayIcon>>,
+}
+
+#[tauri::command]
+async fn get_threat_protection_status(controller: State<'_, protection::controller::ProtectionController>) -> Result<protection::controller::ProtectionStatus, String> {
+    let controller=controller.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || controller.status()).await.map_err(|e|e.to_string())?
+}
+#[tauri::command]
+async fn set_threat_protection(controller: State<'_, protection::controller::ProtectionController>, enabled: bool) -> Result<protection::controller::ProtectionStatus, String> {
+    let controller=controller.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || controller.set_enabled(enabled)).await.map_err(|e|e.to_string())?
+}
+
+#[tauri::command]
+fn get_threat_feed_status(updater: State<'_, protection::updater::FeedUpdater>) -> protection::updater::UpdateStatus {
+    updater.status()
+}
+
+#[tauri::command]
+async fn refresh_threat_feed(controller: State<'_, protection::controller::ProtectionController>) -> Result<protection::controller::ProtectionStatus, String> {
+    let controller=controller.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || controller.refresh()).await.map_err(|e|e.to_string())?
 }
 
 #[tauri::command]
@@ -130,6 +153,7 @@ fn restart_as_administrator(app: tauri::AppHandle) -> Result<(), String> {
     if result.0 as isize <= 32 {
         return Err("Administrator restart was cancelled or unavailable.".into());
     }
+    app.state::<protection::controller::ProtectionController>().stop();
     app.state::<capture::CaptureManager>().stop();
     app.state::<AppState>().monitor.stop();
     app.exit(0);
@@ -150,6 +174,13 @@ pub fn run() {
         .manage(capture::CaptureManager::default())
         .manage(state)
         .setup(move |app| {
+            let feed_updater=protection::updater::FeedUpdater::new(
+                app.path().app_data_dir()?.join("protection").join("feodo-v1.json"),
+            );
+            app.manage(protection::controller::ProtectionController::new(feed_updater.clone(), app.path().app_data_dir()?.join("protection").join("threat-protection-intent.json")));
+            app.manage(feed_updater);
+            app.state::<protection::controller::ProtectionController>().start_updates()?;
+            network::tag_worker::start(&monitor, app.path().app_data_dir()?.join("destination-database"))?;
             let handle = app.handle();
 
             // Load embedded icon
@@ -184,7 +215,8 @@ pub fn run() {
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| {
                     if event.id.as_ref() == "quit" {
-                        app.state::<capture::CaptureManager>().stop();
+                        app.state::<protection::controller::ProtectionController>().stop();
+    app.state::<capture::CaptureManager>().stop();
                         app.state::<AppState>().monitor.stop();
                         app.exit(0);
                     } else if event.id.as_ref() == "toggle" {
@@ -272,6 +304,7 @@ pub fn run() {
         })
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::Destroyed = event {
+                window.state::<protection::controller::ProtectionController>().stop();
                 window.state::<capture::CaptureManager>().stop();
                 window.state::<AppState>().monitor.stop();
             }
@@ -303,6 +336,10 @@ pub fn run() {
             set_appearance,
             list_blocks,
             get_firewall_environment,
+            get_threat_protection_status,
+            set_threat_protection,
+            get_threat_feed_status,
+            refresh_threat_feed,
             set_block,
             restart_as_administrator
         ])
@@ -314,3 +351,7 @@ mod speedtest;
 
 pub mod capture;
 mod capture_commands;
+/// Dispatch internal helpers before starting the UI runtime.
+pub fn run_internal_cli() -> Option<i32> {
+    protection::dns_watchdog_cli::dispatch(&std::env::args_os().skip(1).collect::<Vec<_>>())
+}

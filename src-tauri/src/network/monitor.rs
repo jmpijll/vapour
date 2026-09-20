@@ -34,6 +34,10 @@ pub struct NetworkMonitor {
     enricher: Arc<TrafficEnricher>,
     icon_extractor: Arc<IconExtractor>,
     if_history: Mutex<HashMap<u64, InterfaceDelta>>,
+    ip_configuration: Arc<Mutex<super::ip_config::ConfigCache>>,
+    driver_cache: Arc<Mutex<super::driver_cache::DriverCache>>,
+    wifi_cache: Arc<Mutex<super::wifi_cache::WifiCache>>,
+    destination_tags: Mutex<Option<Arc<super::destination_tags::DestinationTagCache>>>,
     muted_streams: Mutex<HashSet<String>>,
     process_names_cache: Mutex<HashMap<u32, (String, String)>>,
     usage: super::usage::UsageCollector,
@@ -46,11 +50,19 @@ impl NetworkMonitor {
             enricher: Arc::new(TrafficEnricher::new()),
             icon_extractor: Arc::new(IconExtractor::new()),
             if_history: Mutex::new(HashMap::new()),
+            ip_configuration: Arc::new(Mutex::new(Default::default())),
+            driver_cache: Arc::new(Mutex::new(Default::default())),
+            wifi_cache: Arc::new(Mutex::new(Default::default())),
+            destination_tags: Mutex::new(None),
             muted_streams: Mutex::new(HashSet::new()),
             process_names_cache: Mutex::new(HashMap::new()),
             usage: super::usage::UsageCollector::new(),
             firewall_cache: Mutex::new(None),
         }
+    }
+
+    pub fn set_destination_tags(&self, cache: super::destination_tags::DestinationTagCache) {
+        *self.destination_tags.lock()=Some(Arc::new(cache));
     }
 
     pub fn stop(&self) {
@@ -88,10 +100,20 @@ impl NetworkMonitor {
         }
     }
 
+    pub(crate) fn fresh_local_addresses(&self) -> Result<Vec<String>, &'static str> {
+        let now = Instant::now();
+        super::ip_config::request_refresh(&self.ip_configuration, now);
+        self.ip_configuration.lock().fresh_addresses(now)
+    }
+
     fn sample_interfaces(&self, now: Instant) -> (Vec<InterfaceInfo>, u64, u64) {
         let mut interfaces = Vec::new();
         let mut total_down = 0u64;
         let mut total_up = 0u64;
+        super::driver_cache::request(&self.driver_cache, now);
+        let driver_cache = self.driver_cache.lock();
+        super::ip_config::request_refresh(&self.ip_configuration, now);
+        let ip_configuration = self.ip_configuration.lock();
 
         unsafe {
             let mut table_ptr: *mut MIB_IF_TABLE2 = std::ptr::null_mut();
@@ -101,6 +123,9 @@ impl NetworkMonitor {
                 let rows_slice =
                     std::slice::from_raw_parts(&table.Table[0] as *const MIB_IF_ROW2, num_entries);
 
+                let connected_wifi = rows_slice.iter().filter(|r|r.Type == 71 && r.OperStatus.0 == 1).map(|r|format!("{:?}",r.InterfaceGuid)).collect();
+                super::wifi_cache::request(&self.wifi_cache, connected_wifi, now);
+                let wifi_cache = self.wifi_cache.lock();
                 let mut history = self.if_history.lock();
 
                 for row in rows_slice {
@@ -151,6 +176,9 @@ impl NetworkMonitor {
                         total_up += up_bps;
                     }
 
+                    let config = ip_configuration.get(row.InterfaceLuid.Value);
+                    let status = ip_configuration.ip_configuration_status(now);
+                    let config_status = if status == "available" && config.is_none() { "not_available" } else { status };
                     interfaces.push(InterfaceInfo {
                         id: format!("if-{}", if_index),
                         name: desc,
@@ -161,11 +189,20 @@ impl NetworkMonitor {
                         } else {
                             "disconnected".to_string()
                         },
-                        ipv4: None,
-                        ipv6: None,
+                        ipv4: config.as_ref().and_then(|c| c.addresses.iter().find(|a| a.family == "ipv4").map(|a| a.address.clone())),
+                        ipv6: config.as_ref().and_then(|c| c.addresses.iter().find(|a| a.family == "ipv6").map(|a| a.address.clone())),
                         download_speed_bps: down_bps,
                         upload_speed_bps: up_bps,
-                        is_default_gateway: if_type == 71 || if_type == 6,
+                        receive_link_speed_bps: reported_link_speed(row.ReceiveLinkSpeed, is_connected && if_type != 24),
+                        transmit_link_speed_bps: reported_link_speed(row.TransmitLinkSpeed, is_connected && if_type != 24),
+                        is_default_gateway: None, // Interface type does not establish a default route.
+                        details: super::adapter::details(row),
+                        driver: driver_cache.get(&format!("{:?}",row.InterfaceGuid),now),
+                        wifi: (if_type == 71).then(||wifi_cache.get(&format!("{:?}",row.InterfaceGuid),is_connected,now)),
+                        ip_configuration: config,
+                        ip_configuration_status: config_status.into(),
+                        route_configuration: ip_configuration.routes(row.InterfaceLuid.Value),
+                        route_configuration_status: ip_configuration.route_configuration_status(now).into(),
                     });
                 }
 
@@ -204,6 +241,7 @@ impl NetworkMonitor {
             let is_muted = muted.contains(&raw.id);
             let enriched = self.enricher.enrich(&raw.remote_ip, raw.remote_port);
 
+            let destination_tags = raw.remote_ip.parse().ok().and_then(|ip| self.destination_tags.lock().clone().map(|cache|cache.lookup(ip)));
             let stream = SocketStream {
                 id: raw.id,
                 protocol: raw.protocol,
@@ -212,6 +250,7 @@ impl NetworkMonitor {
                 local_port: raw.local_port,
                 remote_ip: raw.remote_ip,
                 remote_port: raw.remote_port,
+                destination_tags,
                 remote_host: enriched.host,
                 country_code: enriched.country_code,
                 country_name: enriched.country_name,
@@ -703,4 +742,21 @@ fn sample_udp_v6() -> Vec<RawSocketRow> {
 /// Fresh ownership table check, without sampling throughput or retaining closed sockets.
 pub fn established_socket_exists(id: &str) -> bool {
     sample_tcp_v4().into_iter().chain(sample_tcp_v6()).any(|s|s.id==id && s.state=="ESTABLISHED")
+}
+
+// Link rates are bits/second, unlike the throughput byte counters.
+fn reported_link_speed(value: u64, connected: bool) -> Option<u64> {
+    (connected && value > 0 && value != u64::MAX).then_some(value)
+}
+
+#[cfg(test)]
+mod link_speed_tests {
+    use super::reported_link_speed;
+    #[test]
+    fn excludes_disconnected_and_unknown_link_rates() {
+        assert_eq!(reported_link_speed(1_000_000_000, true), Some(1_000_000_000));
+        assert_eq!(reported_link_speed(100_000_000, false), None);
+        assert_eq!(reported_link_speed(0, true), None);
+        assert_eq!(reported_link_speed(u64::MAX, true), None);
+    }
 }

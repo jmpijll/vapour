@@ -56,6 +56,7 @@ export function Speedtest({back}:{back:()=>void}) {
     <div className="speedtest-actions">
       <button className="icon-button speedtest-run" disabled={!speedtestAvailable()} aria-label={action} title={speedtestAvailable() ? action : "Open in Vapour"} onClick={()=>running ? controller.current?.abort() : void start()}>{running ? <Square size={20}/> : completedAt || error ? <RotateCcw size={20}/> : <Play size={20}/>}</button>
     </div>
+    <details className="advanced-only"><summary>Measurement</summary><p className="detail-note">HTTP · 10 s per phase</p>{event?.phase && <p className="detail-note">{event.phase} · {event.warmup ? "Warmup" : `${Math.round((event.elapsed_ms || 0) / 1000)} s`}</p>}{serverUrl && <p className="detail-note">{serverUrl}</p>}</details>
     {error && <p role="alert">{error}</p>}
   </section>;
 }

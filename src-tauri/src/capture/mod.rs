@@ -1,10 +1,13 @@
 //! Bounded, user-started interface capture. No global Pktmon session or filters.
 mod endpoint;
+mod bind_snapshot;
+mod tcp_snapshot;
 mod native;
 mod packet;
 mod attribution;
 mod generation;
 mod raw;
+mod runtime_stage;
 mod app;
 mod windivert;
 use parking_lot::Mutex;
@@ -19,6 +22,10 @@ use std::{
 };
 
 pub const MAX_BYTES: u64 = 64 * 1024 * 1024;
+/// Stage and verify the bundled driver without opening a capture handle.
+pub(crate) fn stage_divert_runtime(directory: &std::path::Path) -> Result<PathBuf, String> {
+    app::stage(directory)
+}
 pub const MAX_SECONDS: u64 = 60;
 static NEXT_RUN: AtomicU64 = AtomicU64::new(1);
 #[derive(Clone, Debug, Serialize)]
@@ -136,10 +143,10 @@ impl CaptureManager {
         if let Some(previous)=worker.take(){let _=previous.thread.join();}
         let cancel=Arc::new(AtomicBool::new(false));let cancellation=cancel.clone();let state=self.state.clone();
         let started=std::time::Instant::now();*self.started.lock()=Some(started);
-        *state.lock()=CaptureStatus {active:true,partial:true,scope_label:Some(path),run_id:NEXT_RUN.fetch_add(1,Ordering::Relaxed),..Default::default()};
+        *state.lock()=CaptureStatus {active:true,partial:true,scope_label:Some(path.clone()),run_id:NEXT_RUN.fetch_add(1,Ordering::Relaxed),..Default::default()};
         let (ready,receive)=std::sync::mpsc::sync_channel(1);
         let thread=std::thread::Builder::new().name("vapour-app-capture".into()).spawn(move||{
-            let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||app::capture(&dll,&output,identities,&cancellation,&state,ready)));
+            let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||app::capture(&dll,&output,identities,&path,&cancellation,&state,ready)));
             let mut status=state.lock();status.active=false;status.finalizing=false;status.duration_ms=started.elapsed().as_millis() as u64;
             match result {Ok(Ok(()))=>{},Ok(Err(e))=>{status.error=Some(e);status.path=None;},Err(_)=>{status.error=Some("App capture stopped unexpectedly".into());status.path=None;}}
         }).map_err(|e|{self.state.lock().active=false;e.to_string()})?;
