@@ -28,6 +28,8 @@ jobs:
         run: npm install --global pnpm@11.27.0
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
+      - name: Test verified capture dependency setup
+        run: ./scripts/test-setup-windivert.ps1
       - name: Stage verified capture dependency
         run: ./scripts/setup-windivert.ps1
       - name: Frontend checks
