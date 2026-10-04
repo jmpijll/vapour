@@ -1,0 +1,16 @@
+name: Focused change
+description: Define one addition or repair before opening a PR
+body:
+  - type: textarea
+    id: outcome
+    attributes:
+      label: User-visible outcome
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria and verification
+      description: Keep the work small enough for one PR or list the dependent PRs.
+    validations:
+      required: true

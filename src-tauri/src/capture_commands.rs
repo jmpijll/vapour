@@ -2,6 +2,8 @@ use crate::capture::{CaptureManager,CaptureStatus,CaptureInterface};
 use tauri::{Manager,State};
 use std::path::PathBuf;
 #[tauri::command]
+pub fn capture_capabilities()->crate::capture::CaptureCapabilities{crate::capture::capabilities()}
+#[tauri::command]
 pub async fn capture_interfaces()->Result<Vec<CaptureInterface>,String>{tauri::async_runtime::spawn_blocking(crate::capture::list_interfaces).await.map_err(|e|e.to_string())?}
 #[tauri::command]
 pub fn capture_status(state:State<'_,CaptureManager>)->CaptureStatus{state.status()}
@@ -16,6 +18,7 @@ fn capture_path(app:&tauri::AppHandle)->Result<PathBuf,String>{
 static SESSION_WATCH:parking_lot::Mutex<Option<(u64,String)>>=parking_lot::Mutex::new(None);
 #[tauri::command]
 pub async fn start_app_capture(app:tauri::AppHandle,path:String)->Result<CaptureStatus,String>{
+ crate::capture::require_capture_enabled()?;
  let pids={let state=app.state::<crate::AppState>();let latest=state.latest.lock();
   let snapshot=latest.as_ref().ok_or("Apps unavailable")?;
   snapshot.processes.iter().filter(|p|p.path.eq_ignore_ascii_case(&path)).map(|p|p.pid).collect::<Vec<_>>()};
@@ -26,11 +29,13 @@ pub async fn start_app_capture(app:tauri::AppHandle,path:String)->Result<Capture
 }
 #[tauri::command]
 pub async fn start_capture(app:tauri::AppHandle,interface_id:u32)->Result<CaptureStatus,String>{
+ crate::capture::require_capture_enabled()?;
  let path=capture_path(&app)?;
  tauri::async_runtime::spawn_blocking(move||app.state::<CaptureManager>().start(interface_id,path)).await.map_err(|e|e.to_string())?
 }
 #[tauri::command]
 pub async fn start_session_capture(app:tauri::AppHandle,interface_id:u32,socket_id:String)->Result<CaptureStatus,String>{
+ crate::capture::require_capture_enabled()?;
  let socket={
   let state=app.state::<crate::AppState>();let latest=state.latest.lock();let snapshot=latest.as_ref().ok_or("Connections unavailable")?;
   let now=std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e|e.to_string())?.as_millis() as u64;

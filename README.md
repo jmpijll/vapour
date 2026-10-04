@@ -42,7 +42,7 @@ All screenshots below use built-in **sample data**, not personal traffic. Browse
 
 ## Get started
 
-This is an early, source-first alpha. There is no signed installer or stable binary release yet. Windows x64 is the current native target; Linux and macOS are planned.
+Download an unsigned Windows x64 test build from [Nightly releases](https://github.com/jmpijll/vapour/releases). Extract `Vapour-windows-x64.zip` and run `Vapour.exe`; only Windows and WebView2 are required to run it. Read [the testing scope](docs/TESTING.md) before testing. Packet capture is disabled in nightlies pending isolated driver acceptance. There is no signed installer or stable release yet; Linux and macOS are planned.
 
 ### Requirements
 

@@ -20,7 +20,36 @@ use std::{
 
 pub const MAX_BYTES: u64 = 64 * 1024 * 1024;
 pub const MAX_SECONDS: u64 = 60;
+pub const CAPTURE_DISABLED_REASON: &str = "Packet capture is disabled pending driver validation.";
 static NEXT_RUN: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CaptureCapabilities {
+    pub enabled: bool,
+    pub reason: Option<&'static str>,
+}
+
+pub fn capabilities() -> CaptureCapabilities {
+    if cfg!(feature = "experimental-capture") {
+        CaptureCapabilities {
+            enabled: true,
+            reason: None,
+        }
+    } else {
+        CaptureCapabilities {
+            enabled: false,
+            reason: Some(CAPTURE_DISABLED_REASON),
+        }
+    }
+}
+
+pub(crate) fn require_capture_enabled() -> Result<(), String> {
+    if cfg!(feature = "experimental-capture") {
+        Ok(())
+    } else {
+        Err(CAPTURE_DISABLED_REASON.into())
+    }
+}
 #[derive(Clone, Debug, Serialize)]
 pub struct CaptureInterface {
     pub id: u32,
@@ -128,6 +157,7 @@ pub fn list_interfaces() -> Result<Vec<CaptureInterface>, String> {
 }
 impl CaptureManager {
     pub fn start_app(&self, output: PathBuf, runtime: PathBuf, path: String, pids: Vec<u32>) -> Result<CaptureStatus,String> {
+        require_capture_enabled()?;
         if !output.is_absolute() || pids.is_empty() || pids.len()>64 {return Err("App capture requires a running app".into());}
         let identities=pids.into_iter().map(|pid|app::resolve(pid,&path)).collect::<Result<Vec<_>,_>>()?;
         let dll=app::stage(&runtime)?;
@@ -156,6 +186,7 @@ impl CaptureManager {
         output: PathBuf,
         target: SessionTarget,
     ) -> Result<CaptureStatus, String> {
+        require_capture_enabled()?;
         target.validate()?;
         self.start_scoped(interface_id, output, Some(target))
     }
@@ -165,6 +196,7 @@ impl CaptureManager {
         output: PathBuf,
         target: Option<SessionTarget>,
     ) -> Result<CaptureStatus, String> {
+        require_capture_enabled()?;
         let endpoint = target.as_ref().map(SessionTarget::endpoint).transpose()?;
         if !output.is_absolute() {
             return Err("Capture path must be absolute".into());
@@ -267,6 +299,62 @@ impl Drop for CaptureManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(feature = "experimental-capture"))]
+    #[test]
+    fn disabled_build_rejects_start_methods_before_validation_or_state_mutation() {
+        let manager = CaptureManager::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        *manager.worker.lock() = Some(Worker {
+            cancel: cancel.clone(),
+            thread: std::thread::spawn(|| {}),
+        });
+        *manager.started.lock() = Some(std::time::Instant::now());
+        {
+            let mut status = manager.state.lock();
+            status.run_id = 41;
+            status.path = Some("retained-capture.pcapng".into());
+            status.error = Some("prior status".into());
+        }
+        let invalid_target = SessionTarget {
+            local_ip: "not-an-address".into(),
+            local_port: 0,
+            remote_ip: "also-invalid".into(),
+            remote_port: 0,
+            protocol: "ICMP".into(),
+        };
+        assert_eq!(manager.start(0, PathBuf::new()).unwrap_err(), CAPTURE_DISABLED_REASON);
+        assert_eq!(
+            manager.start_session(0, PathBuf::new(), invalid_target.clone()).unwrap_err(),
+            CAPTURE_DISABLED_REASON
+        );
+        assert_eq!(
+            manager.start_app(PathBuf::new(), PathBuf::new(), String::new(), Vec::new()).unwrap_err(),
+            CAPTURE_DISABLED_REASON
+        );
+        assert_eq!(
+            manager.start_scoped(0, PathBuf::new(), Some(invalid_target)).unwrap_err(),
+            CAPTURE_DISABLED_REASON
+        );
+        let status = manager.status();
+        assert!(!status.active);
+        assert_eq!(status.run_id, 41);
+        assert_eq!(status.path.as_deref(), Some("retained-capture.pcapng"));
+        assert_eq!(status.error.as_deref(), Some("prior status"));
+        assert!(manager.worker.lock().is_some());
+        assert!(!cancel.load(Ordering::Acquire));
+        assert!(manager.started.lock().is_some());
+    }
+
+    #[cfg(not(feature = "experimental-capture"))]
+    #[test]
+    fn disabled_build_reports_capability_reason() {
+        let capability = capabilities();
+        assert!(!capability.enabled);
+        assert_eq!(capability.reason, Some(CAPTURE_DISABLED_REASON));
+        assert_eq!(require_capture_enabled(), Err(CAPTURE_DISABLED_REASON.into()));
+    }
+
     #[test]
     fn exporting_old_file_does_not_clear_new_capture() {
         let manager = CaptureManager::default();
