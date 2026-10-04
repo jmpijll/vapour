@@ -9,7 +9,11 @@ try {
     $taskHead = (& git rev-parse HEAD).Trim()
     if ($LASTEXITCODE -or $taskHead -ne $Commit) { throw 'Package must match the checked-out commit' }
     $taskDirty = & git status --porcelain --untracked-files=no
-    if ($LASTEXITCODE -or $taskDirty) { throw 'Tracked source changed after checkout' }
+    if ($LASTEXITCODE -or $taskDirty) {
+        $taskDirty | Write-Output
+        & git diff --stat
+        throw 'Tracked source changed after checkout'
+    }
     $taskExe = (Resolve-Path -LiteralPath $Executable).Path
     $taskDestination = Join-Path $taskRoot 'outputs/nightly'
     if ((Test-Path -LiteralPath $taskDestination) -or (Test-Path -LiteralPath 'outputs/nightly-package')) { throw 'Nightly output already exists' }
