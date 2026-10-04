@@ -153,6 +153,7 @@ pub struct CaptureManager {
     state: Arc<Mutex<CaptureStatus>>,
 }
 pub fn list_interfaces() -> Result<Vec<CaptureInterface>, String> {
+    require_capture_enabled()?;
     native::list_interfaces()
 }
 impl CaptureManager {
@@ -299,6 +300,15 @@ impl Drop for CaptureManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(feature = "experimental-capture"))]
+    #[test]
+    fn disabled_build_rejects_interface_listing_before_native_initialization() {
+        assert!(matches!(
+            list_interfaces(),
+            Err(reason) if reason == CAPTURE_DISABLED_REASON
+        ));
+    }
 
     #[cfg(not(feature = "experimental-capture"))]
     #[test]

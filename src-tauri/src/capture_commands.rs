@@ -4,7 +4,7 @@ use std::path::PathBuf;
 #[tauri::command]
 pub fn capture_capabilities()->crate::capture::CaptureCapabilities{crate::capture::capabilities()}
 #[tauri::command]
-pub async fn capture_interfaces()->Result<Vec<CaptureInterface>,String>{tauri::async_runtime::spawn_blocking(crate::capture::list_interfaces).await.map_err(|e|e.to_string())?}
+pub async fn capture_interfaces()->Result<Vec<CaptureInterface>,String>{crate::capture::require_capture_enabled()?;tauri::async_runtime::spawn_blocking(crate::capture::list_interfaces).await.map_err(|e|e.to_string())?}
 #[tauri::command]
 pub fn capture_status(state:State<'_,CaptureManager>)->CaptureStatus{state.status()}
 fn capture_path(app:&tauri::AppHandle)->Result<PathBuf,String>{
