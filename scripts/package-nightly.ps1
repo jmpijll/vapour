@@ -29,7 +29,7 @@ try {
     & git archive --format=zip --output=$taskSource $Commit
     if ($LASTEXITCODE) { throw 'Cannot archive corresponding source' }
     $taskUpstream = Join-Path $taskPackage.FullName 'WinDivert-v2.2.2-source.zip'
-    Invoke-WebRequest -Uri 'https://codeload.github.com/basil00/WinDivert/zip/refs/tags/v2.2.2' -OutFile $taskUpstream
+    Invoke-WebRequest -Uri 'https://codeload.github.com/basil00/WinDivert/zip/1789526ecfb9ff5397c94f9f54c1a3dc2fb60440' -OutFile $taskUpstream
     $taskUpstreamHash = (Get-FileHash -LiteralPath $taskUpstream -Algorithm SHA256).Hash
     if ($taskUpstreamHash -ne '25054821D47EC0EF2227C79F3D6688A3A11D6A128D8F103710D1022E92EA1054') { throw 'WinDivert corresponding source checksum mismatch' }
     $taskMetadata = [ordered]@{
