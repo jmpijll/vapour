@@ -22,7 +22,7 @@ tauri-plugin-log = "2"
 window-vibrancy = "0.6"
 tokio = { version = "1", features = ["full"] }
 parking_lot = "0.12"
-base64 = "0.22"
+base64 = "0.23"
 image = { version = "0.25", default-features = false, features = ["png"] }
 windows = { version = "0.58", features = [
     "Win32_Foundation",
