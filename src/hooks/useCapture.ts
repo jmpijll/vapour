@@ -18,6 +18,7 @@ export type CaptureStatus = {
   scope_label?: string | null;
   error: string | null;
 };
+export type CaptureCapabilities = { enabled: boolean; reason: string | null };
 export type CaptureInterface = { id: number; name: string };
 export type CaptureSession = { socketId: string; label: string; address: string };
 export type CaptureAppTarget = { path: string; label: string };
@@ -34,6 +35,10 @@ const idle: CaptureStatus = {
   scope_label: null,
   error: null,
 };
+const disabledCapabilities: CaptureCapabilities = {
+  enabled: false,
+  reason: "Capture is available only in the Windows desktop release.",
+};
 const native = "__TAURI_INTERNALS__" in window;
 
 export const captureInterfaces = () =>
@@ -46,6 +51,7 @@ export function useCapture() {
   const [appTarget, setAppTargetState] = useState<CaptureAppTarget | null>(null);
   const [interfaceId, setInterfaceId] = useState<number | null>(null);
   const [status, setStatus] = useState(idle);
+  const [capabilities, setCapabilities] = useState(disabledCapabilities);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
@@ -54,6 +60,21 @@ export function useCapture() {
       const value = await invoke<CaptureStatus>("capture_status");
       setStatus({ ...idle, ...value, finalizing: value.finalizing === true });
     }
+  }, []);
+
+  useEffect(() => {
+    if (!native) return;
+    let disposed = false;
+    void invoke<CaptureCapabilities>("capture_capabilities")
+      .then((value) => {
+        if (!disposed) setCapabilities(value);
+      })
+      .catch(() => {
+        if (!disposed) setCapabilities(disabledCapabilities);
+      });
+    return () => {
+      disposed = true;
+    };
   }, []);
 
   useEffect(() => {
@@ -105,19 +126,22 @@ export function useCapture() {
     setAppTargetState(null);
   }, []);
   const startInterface = (selectedInterfaceId: number) =>
-    sessionState
-      ? action("start_session_capture", {
-          interfaceId: selectedInterfaceId,
-          socketId: sessionState.socketId,
-        })
-      : action("start_capture", { interfaceId: selectedInterfaceId });
+    !capabilities.enabled
+      ? Promise.resolve()
+      : sessionState
+        ? action("start_session_capture", {
+            interfaceId: selectedInterfaceId,
+            socketId: sessionState.socketId,
+          })
+        : action("start_capture", { interfaceId: selectedInterfaceId });
   const startApp = () =>
-    appTarget
+    appTarget && capabilities.enabled
       ? action("start_app_capture", { path: appTarget.path })
       : Promise.resolve();
 
   return {
     status,
+    capabilities,
     busy,
     error,
     native,

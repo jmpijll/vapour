@@ -1,38 +1,134 @@
 name: Windows checks
 on:
-  push:
   pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    - cron: '17 1 * * *'
+  workflow_dispatch:
 permissions:
   contents: read
+concurrency:
+  group: windows-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
-  check:
-    runs-on: windows-latest
-    timeout-minutes: 30
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.plan.outputs.build }}
+      publish: ${{ steps.plan.outputs.publish }}
+      tag: ${{ steps.plan.outputs.tag }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3
+        id: plan
+        with:
+          script: |
+            const { nightlyTag, planNightly } = require('./scripts/nightly-plan.cjs');
+            let release = null;
+            if (context.ref === 'refs/heads/main' && context.eventName !== 'pull_request') {
+              try {
+                release = (await github.rest.repos.getReleaseByTag({ ...context.repo, tag: nightlyTag(context.sha) })).data;
+              } catch (error) {
+                if (error.status !== 404) throw error;
+              }
+            }
+            const plan = planNightly({sha: context.sha, ref: context.ref, event: context.eventName, release});
+            for (const [key, value] of Object.entries(plan)) core.setOutput(key, String(value));
+  check:
+    needs: plan
+    if: needs.plan.outputs.build == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      CARGO_BUILD_JOBS: '2'
+      GOMAXPROCS: '2'
+      GOTOOLCHAIN: local
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: '24'
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: '1.27.1'
+          cache-dependency-path: sidecar/librespeed/go.sum
       - name: Install Rust toolchain
         run: rustup show active-toolchain
       - name: Install pnpm
         run: npm install --global pnpm@11.27.0
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
-      - name: Stage verified capture dependency
+      - name: Stage verified capture dependency (does not load a driver)
         run: ./scripts/setup-windivert.ps1
-      - name: Frontend checks
+      - name: Frontend and release-policy checks
         run: |
           pnpm lint
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
           pnpm build
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
           node --experimental-strip-types --test src/utils/sessionHistory.test.ts src/utils/speedtest.test.ts
-      - name: Rust checks
-        run: cargo test --manifest-path src-tauri/Cargo.toml --locked --lib
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          node --test scripts/nightly-plan.test.cjs
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Rust checks (serial; no ignored native tests)
+        run: cargo test --manifest-path src-tauri/Cargo.toml --locked --lib -- --test-threads=1
+      - name: Opt-in capture compile check (no driver execution)
+        run: cargo check --manifest-path src-tauri/Cargo.toml --locked --lib --features experimental-capture
       - name: Speedtest engine checks
         working-directory: sidecar/librespeed
-        run: go test ./...
-      - name: Standalone build
+        run: |
+          go test ./...
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          go vet ./...
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Standalone build (capture disabled)
         run: pnpm build:native
+      - name: Package exact commit with corresponding source
+        run: ./scripts/package-nightly.ps1 -Executable src-tauri/target/release/vapour.exe -Commit $env:GITHUB_SHA
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: windows-nightly
+          path: outputs/nightly/*
+          if-no-files-found: error
+          retention-days: 14
+  publish:
+    needs: [plan, check]
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && needs.plan.outputs.publish == 'true' && needs.check.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      NIGHTLY_TAG: ${{ needs.plan.outputs.tag }}
+      NIGHTLY_SHA: ${{ github.sha }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: windows-nightly
+          path: nightly
+      - name: Publish complete prerelease
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd nightly
+          sha256sum --check SHA256SUMS.txt
+          test "$(jq -r .commit release.json)" = "$NIGHTLY_SHA"
+          test "$(jq -r .captureEnabled release.json)" = false
+          printf 'Windows x64 unsigned test build for commit `%s`.\n\nDownload **Vapour-windows-x64.zip**, extract it and run Vapour.exe on Windows with WebView2. Capture is disabled pending isolated driver acceptance. Administrator measurement/firewall actions are experimental. See TESTING.md inside the ZIP. This is a prerelease, not a stable release.\n' "$NIGHTLY_SHA" > release-notes.md
+          if gh release view "$NIGHTLY_TAG" --json isDraft > existing.json; then
+            test "$(jq -r .isDraft existing.json)" = true
+          else
+            gh release create "$NIGHTLY_TAG" --target "$NIGHTLY_SHA" --draft --prerelease --title "Windows nightly ${NIGHTLY_SHA:0:12}" --notes-file release-notes.md
+          fi
+          gh release upload "$NIGHTLY_TAG" Vapour-windows-x64.zip SHA256SUMS.txt release.json --clobber
+          gh release edit "$NIGHTLY_TAG" --draft=false --prerelease --latest=false --notes-file release-notes.md

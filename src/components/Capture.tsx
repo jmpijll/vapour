@@ -50,7 +50,7 @@ export function Capture({
   const [error, setError] = useState("");
   const selected = capture.interfaceId;
   const picker = useRef<HTMLDivElement>(null);
-  const { status, busy } = capture;
+  const { status, busy, capabilities } = capture;
   const appTarget = capture.appTarget;
   const session = capture.session;
   const bytes =
@@ -59,6 +59,7 @@ export function Capture({
       : `${(status.bytes / 1048576).toFixed(1)} MiB`;
   const canStart =
     capture.native &&
+    capabilities.enabled &&
     !busy &&
     !status.active &&
     !status.finalizing &&
@@ -67,7 +68,7 @@ export function Capture({
       : interfaces.some((item) => item.id === selected) && sessionAvailable);
 
   useEffect(() => {
-    if (!capture.native || !elevated || appTarget) return;
+    if (!capture.native || !capabilities.enabled || !elevated || appTarget) return;
     let disposed = false;
     captureInterfaces()
       .then((value) => {
@@ -79,7 +80,7 @@ export function Capture({
     return () => {
       disposed = true;
     };
-  }, [capture.native, elevated, appTarget]);
+  }, [capture.native, capabilities.enabled, elevated, appTarget]);
 
   useEffect(() => {
     const outside = (event: PointerEvent) => {
@@ -148,7 +149,7 @@ export function Capture({
         </div>
       )}
 
-      {!elevated && capture.native ? (
+      {!elevated && capture.native && capabilities.enabled ? (
         <button className="measurement-prompt" onClick={elevate}>
           <ShieldCheck size={14} />
           Enable capture
@@ -303,6 +304,12 @@ export function Capture({
               <FolderOpen size={19} />
             </button>
           </div>
+
+          {!capabilities.enabled && (
+            <p className="detail-note" role="status">
+              {capabilities.reason || "Packet capture is disabled in this build."}
+            </p>
+          )}
 
           {status.dropped > 0 && (
             <p className="capture-warning" role="status">

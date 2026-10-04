@@ -1,6 +1,6 @@
 # Contributing
 
-Vapour is an early Windows-first project. For large changes, open an issue first so implementation and UX expectations can be agreed before substantial work begins.
+Vapour is an early Windows-first project. Each addition or repair starts with a focused GitHub issue containing its user-visible outcome and acceptance criteria. Implement it in one PR, or a short sequence of explicitly dependent PRs. Link the issue with `Closes #number`. Keep unrelated refactors and optimization out of release repairs.
 
 ## Local checks
 
@@ -24,6 +24,8 @@ Native capture and firewall tests need explicit, isolated test traffic and admin
 Keep the interface calm and compact. Prefer familiar icons with accessible labels and useful tooltips to permanent explanatory text. Preserve keyboard navigation, narrow layouts, reduced-motion preferences and both themes. Do not present unavailable measurements as zero or estimates as observed traffic.
 
 ## Pull requests
+
+Work on a branch and submit a PR against `main`; do not push product changes directly to `main`. CI checks and builds the exact PR commit and uploads a downloadable review package. After a reviewed PR merges, the same checks run on `main` and a successful build publishes a Windows nightly prerelease. The nightly schedule retries missing releases but skips commits already successfully published. Failed checks never publish. Users download from [Releases](https://github.com/jmpijll/vapour/releases); stable releases remain separate.
 
 Explain the user-visible change and relevant verification. Include sample-data screenshots for visual changes. Keep recordings, private logs, generated executables, credentials and local machine paths out of commits. New dependencies need provenance and license review. Do not broaden a capture or firewall rule when an exact scope cannot be established.
 

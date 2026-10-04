@@ -1,0 +1,24 @@
+name: Nightly bug report
+description: Report a reproducible problem in a Windows nightly
+title: "[Bug] "
+body:
+  - type: input
+    id: commit
+    attributes:
+      label: Nightly commit
+      description: Copy the commit from release.json in the downloaded ZIP.
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version and administrator status
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps, expected result and actual result
+      description: Redact private paths, addresses, hostnames and screenshots.
+    validations:
+      required: true

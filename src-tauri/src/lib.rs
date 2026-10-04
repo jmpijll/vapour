@@ -284,6 +284,7 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            capture_commands::capture_capabilities,
             capture_commands::capture_interfaces,
             capture_commands::capture_status,
             capture_commands::start_capture,
