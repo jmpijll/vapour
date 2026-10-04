@@ -45,7 +45,7 @@ windows = { version = "0.58", features = [
     "Win32_System_Diagnostics_ToolHelp"
 ] }
 ferrisetw = "1.2.0"
-sha2 = "0.10"
+sha2 = "0.11"
 
 socket2 = "0.6"
 
