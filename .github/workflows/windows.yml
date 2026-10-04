@@ -102,7 +102,7 @@ jobs:
           retention-days: 14
   publish:
     needs: [plan, check]
-    if: needs.plan.outputs.publish == 'true' && needs.check.result == 'success'
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && needs.plan.outputs.publish == 'true' && needs.check.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write
