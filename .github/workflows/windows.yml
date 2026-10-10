@@ -94,7 +94,7 @@ jobs:
         run: pnpm build:native
       - name: Package exact commit with corresponding source
         run: ./scripts/package-nightly.ps1 -Executable src-tauri/target/release/vapour.exe -Commit $env:GITHUB_SHA
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: windows-nightly
           path: outputs/nightly/*
